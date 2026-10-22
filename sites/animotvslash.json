@@ -1,0 +1,845 @@
+{
+  "name": "animotvslash",
+  "baseUrl": "https://animotvslash.org",
+  "operations": [
+    {
+      "name": "search",
+      "description": "Live anime search via the site search overlay (POST admin-ajax ts_ac_do_search)",
+      "request": {
+        "method": "POST",
+        "url": "https://animotvslash.org/wp-admin/admin-ajax.php",
+        "headers": {
+          "accept": "text/plain, */*; q=0.01",
+          "accept-language": "en-US,en;q=0.9",
+          "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "origin": "https://animotvslash.org",
+          "priority": "u=1, i",
+          "referer": "https://animotvslash.org/",
+          "sec-ch-ua": "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"Linux\"",
+          "sec-fetch-dest": "empty",
+          "sec-fetch-mode": "cors",
+          "sec-fetch-site": "same-origin",
+          "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+          "x-requested-with": "XMLHttpRequest"
+        },
+        "body": "action=ts_ac_do_search&ts_ac_query=%7Bq%7D"
+      },
+      "slots": [
+        {
+          "param": "q",
+          "at": [
+            "form:ts_ac_query"
+          ]
+        }
+      ],
+      "volatile": [],
+      "trigger": {
+        "url": "https://animotvslash.org/",
+        "steps": [
+          {
+            "action": "press",
+            "value": "s"
+          },
+          {
+            "action": "wait",
+            "ms": 600
+          },
+          {
+            "action": "fill",
+            "selector": "#as-so-input",
+            "value": "{q}"
+          },
+          {
+            "action": "wait",
+            "ms": 2500
+          }
+        ]
+      },
+      "match": {
+        "method": "POST",
+        "host": "animotvslash.org",
+        "path": "/wp-admin/admin-ajax.php"
+      },
+      "response": {
+        "format": "json",
+        "contentType": "text/html; charset=UTF-8",
+        "extract": "anime[*].all",
+        "pick": [
+          "id=ID",
+          "title=post_title",
+          "url=post_link",
+          "image=post_image",
+          "genres=post_genres",
+          "type=post_type",
+          "latest=post_latest",
+          "lang=post_sub"
+        ]
+      },
+      "params": [
+        {
+          "name": "q",
+          "type": "string",
+          "required": true,
+          "example": "one piece"
+        }
+      ],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false
+    },
+    {
+      "name": "series",
+      "description": "All episodes of an anime series page (DESC order), scraped from the server-rendered episode list",
+      "request": {
+        "method": "GET",
+        "url": "https://animotvslash.org/anime/%7Bslug%7D/",
+        "headers": {
+          "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "accept-language": "en-US,en;q=0.9",
+          "priority": "u=0, i",
+          "sec-ch-ua": "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"Linux\"",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "sec-fetch-user": "?1",
+          "upgrade-insecure-requests": "1",
+          "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        }
+      },
+      "slots": [
+        {
+          "param": "slug",
+          "at": [
+            "path:1"
+          ]
+        }
+      ],
+      "volatile": [],
+      "trigger": {
+        "url": "https://animotvslash.org/anime/{slug}/"
+      },
+      "match": {
+        "method": "GET",
+        "host": "animotvslash.org",
+        "path": "/anime/*/"
+      },
+      "response": {
+        "format": "html",
+        "contentType": "",
+        "html": {
+          "items": "ul#ts-ep-list li",
+          "fields": {
+            "url": "a@href",
+            "num": ".epl-num",
+            "title": ".epl-title",
+            "date": ".epl-date"
+          }
+        }
+      },
+      "params": [
+        {
+          "name": "slug",
+          "type": "string",
+          "required": true,
+          "example": "one-piece"
+        }
+      ],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false
+    },
+    {
+      "name": "episode",
+      "description": "Video servers of an episode page: label (e.g. 'Sub - ANIMO-P') plus base64-encoded iframe HTML in value (atob(value) -> iframe src; ANIMO-P src hash is base64 JSON with master/alt HLS+MP4 URLs, subs, fonts, skip markers, thumbnails)",
+      "request": {
+        "method": "GET",
+        "url": "https://animotvslash.org/%7Bslug%7D/",
+        "headers": {
+          "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "accept-language": "en-US,en;q=0.9",
+          "priority": "u=0, i",
+          "sec-ch-ua": "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"Linux\"",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "sec-fetch-user": "?1",
+          "upgrade-insecure-requests": "1",
+          "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        }
+      },
+      "slots": [
+        {
+          "param": "slug",
+          "at": [
+            "path:0"
+          ]
+        }
+      ],
+      "volatile": [],
+      "trigger": {
+        "url": "https://animotvslash.org/{slug}/"
+      },
+      "match": {
+        "method": "GET",
+        "host": "animotvslash.org",
+        "path": "/*/"
+      },
+      "response": {
+        "format": "html",
+        "contentType": "",
+        "html": {
+          "items": "select.mirror option",
+          "fields": {
+            "label": "",
+            "value": "@value",
+            "index": "@data-index"
+          }
+        }
+      },
+      "params": [
+        {
+          "name": "slug",
+          "type": "string",
+          "required": true,
+          "example": "reincarnated-as-a-sword-season-2-episode-4"
+        }
+      ],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false
+    },
+    {
+      "name": "find-episode",
+      "description": "Map series post ID + episode number -> episode post ID via wp-json animo/v1 (coverage is partial: many series return id=null; get the series ID from wp/v2/anime?slug=... or the search op)",
+      "request": {
+        "method": "GET",
+        "url": "https://animotvslash.org/wp-json/animo/v1/find-episode?seri=%7Bseri%7D&ep=%7Bep%7D",
+        "headers": {
+          "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "accept-language": "en-US,en;q=0.9",
+          "priority": "u=0, i",
+          "sec-ch-ua": "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"Linux\"",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "sec-fetch-user": "?1",
+          "upgrade-insecure-requests": "1",
+          "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        }
+      },
+      "slots": [
+        {
+          "param": "seri",
+          "at": [
+            "query:seri"
+          ]
+        },
+        {
+          "param": "ep",
+          "at": [
+            "query:ep"
+          ]
+        }
+      ],
+      "volatile": [],
+      "trigger": {
+        "url": "https://animotvslash.org/wp-json/animo/v1/find-episode?seri={seri}&ep={ep}"
+      },
+      "match": {
+        "method": "GET",
+        "host": "animotvslash.org",
+        "path": "/wp-json/animo/v1/find-episode"
+      },
+      "response": {
+        "format": "json",
+        "contentType": "application/json; charset=UTF-8",
+        "extract": "id",
+        "pick": [
+          "episodeId"
+        ]
+      },
+      "params": [
+        {
+          "name": "seri",
+          "type": "string",
+          "required": true,
+          "example": "589"
+        },
+        {
+          "name": "ep",
+          "type": "string",
+          "required": true,
+          "example": "1"
+        }
+      ],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false
+    },
+    {
+      "name": "browse",
+      "description": "Browse the anime library with filters, 48/page: order=latest|popular|rating|title|oldest|updated, type=TV|Movie|OVA|ONA|Special|Live Action|Music, status=Ongoing|Completed|Upcoming|Hiatus. Page 1 lives at /anime/ (no /page/1/ segment). Add sub=Sub|Dub|RAW or genre[]=slug to the URL for more filters (see browse-genre/browse-dub).",
+      "request": {
+        "method": "GET",
+        "url": "https://animotvslash.org/anime/page/%7Bpage%7D/?order=%7Border%7D&type=%7Btype%7D&status=%7Bstatus%7D",
+        "headers": {
+          "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "accept-language": "en-US,en;q=0.9",
+          "priority": "u=0, i",
+          "sec-ch-ua": "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"Linux\"",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "sec-fetch-user": "?1",
+          "upgrade-insecure-requests": "1",
+          "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        }
+      },
+      "slots": [
+        {
+          "param": "page",
+          "at": [
+            "path:2"
+          ]
+        },
+        {
+          "param": "order",
+          "at": [
+            "query:order"
+          ]
+        },
+        {
+          "param": "type",
+          "at": [
+            "query:type"
+          ]
+        },
+        {
+          "param": "status",
+          "at": [
+            "query:status"
+          ]
+        }
+      ],
+      "volatile": [],
+      "trigger": {
+        "url": "https://animotvslash.org/anime/page/{page}/?order={order}&type={type}&status={status}"
+      },
+      "match": {
+        "method": "GET",
+        "host": "animotvslash.org",
+        "path": "/anime/page/*/"
+      },
+      "response": {
+        "format": "html",
+        "contentType": "text/html; charset=UTF-8",
+        "html": {
+          "items": ".abr .bsx",
+          "fields": {
+            "url": "a@href",
+            "title": "a@title",
+            "postId": "a@rel",
+            "type": ".typez",
+            "subs": "span[title=\"Subbed episodes\"]",
+            "dubs": "span[title=\"Dubbed episodes\"]",
+            "total": "span[title=\"Total episodes\"]",
+            "image": "img@src"
+          }
+        }
+      },
+      "params": [
+        {
+          "name": "page",
+          "type": "string",
+          "required": true,
+          "example": "2"
+        },
+        {
+          "name": "order",
+          "type": "string",
+          "required": true,
+          "example": "popular"
+        },
+        {
+          "name": "type",
+          "type": "string",
+          "required": true,
+          "example": "TV"
+        },
+        {
+          "name": "status",
+          "type": "string",
+          "required": true,
+          "example": "Ongoing"
+        }
+      ],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false
+    },
+    {
+      "name": "browse-genre",
+      "description": "Browse by genre, 48/page: order=latest|popular|rating|title|oldest|updated, genre=<slug from the genres op>, optional type=TV|Movie|OVA|ONA|Special|Live Action|Music. Page 1 lives at /anime/. Append status= or sub= for more filters.",
+      "request": {
+        "method": "GET",
+        "url": "https://animotvslash.org/anime/page/%7Bpage%7D/?order=%7Border%7D&genre%5B0%5D=%7Bgenre%7D&type=%7Btype%7D",
+        "headers": {
+          "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "accept-language": "en-US,en;q=0.9",
+          "priority": "u=0, i",
+          "sec-ch-ua": "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"Linux\"",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "sec-fetch-user": "?1",
+          "upgrade-insecure-requests": "1",
+          "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        }
+      },
+      "slots": [
+        {
+          "param": "page",
+          "at": [
+            "path:2"
+          ]
+        },
+        {
+          "param": "order",
+          "at": [
+            "query:order"
+          ]
+        },
+        {
+          "param": "genre",
+          "at": [
+            "query:genre[0]"
+          ]
+        },
+        {
+          "param": "type",
+          "at": [
+            "query:type"
+          ]
+        }
+      ],
+      "volatile": [],
+      "trigger": {
+        "url": "https://animotvslash.org/anime/page/{page}/?order={order}&genre[]={genre}&type={type}"
+      },
+      "match": {
+        "method": "GET",
+        "host": "animotvslash.org",
+        "path": "/anime/page/*/"
+      },
+      "response": {
+        "format": "html",
+        "contentType": "text/html; charset=UTF-8",
+        "html": {
+          "items": ".abr .bsx",
+          "fields": {
+            "url": "a@href",
+            "title": "a@title",
+            "postId": "a@rel",
+            "type": ".typez",
+            "subs": "span[title=\"Subbed episodes\"]",
+            "dubs": "span[title=\"Dubbed episodes\"]",
+            "total": "span[title=\"Total episodes\"]",
+            "image": "img@src"
+          }
+        }
+      },
+      "params": [
+        {
+          "name": "page",
+          "type": "string",
+          "required": true,
+          "example": "2"
+        },
+        {
+          "name": "order",
+          "type": "string",
+          "required": true,
+          "example": "popular"
+        },
+        {
+          "name": "genre",
+          "type": "string",
+          "required": true,
+          "example": "action"
+        },
+        {
+          "name": "type",
+          "type": "string",
+          "required": true,
+          "example": "TV"
+        }
+      ],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false
+    },
+    {
+      "name": "browse-dub",
+      "description": "All English-dub anime on the site (16 titles, single page). order=latest|popular|rating|title|oldest|updated. Dub series are separate '-dub' entries whose episodes usually have only the P2P 'Animo-SS' server (p2pplay).",
+      "request": {
+        "method": "GET",
+        "url": "https://animotvslash.org/anime/?sub=Dub&order=%7Border%7D",
+        "headers": {
+          "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "accept-language": "en-US,en;q=0.9",
+          "priority": "u=0, i",
+          "sec-ch-ua": "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"Linux\"",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "sec-fetch-user": "?1",
+          "upgrade-insecure-requests": "1",
+          "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        }
+      },
+      "slots": [
+        {
+          "param": "order",
+          "at": [
+            "query:order"
+          ]
+        }
+      ],
+      "volatile": [],
+      "trigger": {
+        "url": "https://animotvslash.org/anime/?sub=Dub&order={order}"
+      },
+      "match": {
+        "method": "GET",
+        "host": "animotvslash.org",
+        "path": "/anime/"
+      },
+      "response": {
+        "format": "html",
+        "contentType": "text/html; charset=UTF-8",
+        "html": {
+          "items": ".abr .bsx",
+          "fields": {
+            "url": "a@href",
+            "title": "a@title",
+            "postId": "a@rel",
+            "type": ".typez",
+            "subs": "span[title=\"Subbed episodes\"]",
+            "dubs": "span[title=\"Dubbed episodes\"]",
+            "total": "span[title=\"Total episodes\"]",
+            "image": "img@src"
+          }
+        }
+      },
+      "params": [
+        {
+          "name": "order",
+          "type": "string",
+          "required": true,
+          "example": "latest"
+        }
+      ],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false
+    },
+    {
+      "name": "series-info",
+      "description": "Series details/metadata: title, alt titles, status, type, season, studio, producers, genres, rating, member score, synopsis, cover.",
+      "request": {
+        "method": "GET",
+        "url": "https://animotvslash.org/anime/%7Bslug%7D/",
+        "headers": {
+          "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "accept-language": "en-US,en;q=0.9",
+          "priority": "u=0, i",
+          "sec-ch-ua": "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"Linux\"",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "sec-fetch-user": "?1",
+          "upgrade-insecure-requests": "1",
+          "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        }
+      },
+      "slots": [
+        {
+          "param": "slug",
+          "at": [
+            "path:1"
+          ]
+        }
+      ],
+      "volatile": [],
+      "trigger": {
+        "url": "https://animotvslash.org/anime/{slug}/"
+      },
+      "match": {
+        "method": "GET",
+        "host": "animotvslash.org",
+        "path": "/anime/*/"
+      },
+      "response": {
+        "format": "html",
+        "contentType": "text/html; charset=UTF-8",
+        "html": {
+          "items": "body",
+          "fields": {
+            "title": "h1.entry-title",
+            "altTitles": "span.alter",
+            "status": ".aap-status",
+            "type": ".aap-chips a[href*=\"status=&type=\"]",
+            "season": ".aap-chips a[href*=\"/season/\"]",
+            "studio": ".spe a[href*=\"/studio/\"]",
+            "producers": "all:.spe a[href*=\"/producer/\"]",
+            "genres": "all:.genxed a",
+            "rating": "meta[itemprop=ratingValue]@content",
+            "memberScore": ".aap-mscore b",
+            "description": "div[itemprop=description]",
+            "cover": ".thumbook .thumb img@src"
+          }
+        }
+      },
+      "params": [
+        {
+          "name": "slug",
+          "type": "string",
+          "required": true,
+          "example": "one-piece"
+        }
+      ],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false
+    },
+    {
+      "name": "trending",
+      "description": "Trending Today episode cards from the homepage (episodes, not series - the newest episodes people watch, e.g. Cyberpunk: Edgerunners 2 Episode 10).",
+      "request": {
+        "method": "GET",
+        "url": "https://animotvslash.org/",
+        "headers": {
+          "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "accept-language": "en-US,en;q=0.9",
+          "priority": "u=0, i",
+          "sec-ch-ua": "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"Linux\"",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "sec-fetch-user": "?1",
+          "upgrade-insecure-requests": "1",
+          "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        }
+      },
+      "slots": [],
+      "volatile": [],
+      "trigger": {
+        "url": "https://animotvslash.org/"
+      },
+      "match": {
+        "host": "animotvslash.org",
+        "path": "/"
+      },
+      "response": {
+        "format": "html",
+        "contentType": "text/html; charset=UTF-8",
+        "html": {
+          "items": "div.popconslide .bsx",
+          "fields": {
+            "url": "a@href",
+            "title": "a@title",
+            "postId": "a@rel",
+            "type": ".typez",
+            "status": ".status",
+            "subs": "span[title=\"Subbed episodes\"]",
+            "dubs": "span[title=\"Dubbed episodes\"]",
+            "total": "span[title=\"Total episodes\"]",
+            "score": ".animo-rt",
+            "image": "img@src"
+          }
+        }
+      },
+      "params": [],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false
+    },
+    {
+      "name": "schedule",
+      "description": "Weekly airing schedule: 7 day sections (today first), each with parallel lists of titles, series URLs and poster images for that day.",
+      "request": {
+        "method": "GET",
+        "url": "https://animotvslash.org/schedule/",
+        "headers": {
+          "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "accept-language": "en-US,en;q=0.9",
+          "priority": "u=0, i",
+          "sec-ch-ua": "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"Linux\"",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "sec-fetch-user": "?1",
+          "upgrade-insecure-requests": "1",
+          "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        }
+      },
+      "slots": [],
+      "volatile": [],
+      "trigger": {
+        "url": "https://animotvslash.org/schedule/"
+      },
+      "match": {
+        "host": "animotvslash.org",
+        "path": "/schedule/"
+      },
+      "response": {
+        "format": "html",
+        "contentType": "text/html; charset=UTF-8",
+        "html": {
+          "items": "section.asch-day",
+          "fields": {
+            "date": "h2.asch-dayhead span",
+            "titles": "all:.asch-title",
+            "urls": "all:a.asch-card@href",
+            "images": "all:.asch-poster img@src"
+          }
+        }
+      },
+      "params": [],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false
+    },
+    {
+      "name": "genres",
+      "description": "All 73 genres with anime counts, for filter UIs. Use the slug with browse-genre.",
+      "request": {
+        "method": "GET",
+        "url": "https://animotvslash.org/genres/",
+        "headers": {
+          "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "accept-language": "en-US,en;q=0.9",
+          "priority": "u=0, i",
+          "sec-ch-ua": "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"Linux\"",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "sec-fetch-user": "?1",
+          "upgrade-insecure-requests": "1",
+          "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        }
+      },
+      "slots": [],
+      "volatile": [],
+      "trigger": {
+        "url": "https://animotvslash.org/genres/"
+      },
+      "match": {
+        "host": "animotvslash.org",
+        "path": "/genres/"
+      },
+      "response": {
+        "format": "html",
+        "contentType": "text/html; charset=UTF-8",
+        "html": {
+          "items": "a.abt",
+          "fields": {
+            "name": "span",
+            "url": "@href",
+            "slug": "@data-t",
+            "count": "b"
+          }
+        }
+      },
+      "params": [],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false
+    },
+    {
+      "name": "player-config",
+      "description": "Default embed player of an episode. config = the base64url JSON from the ANIMO-P player.animotv.ru hash (empty when the default server is not ANIMO-P): atob + JSON.parse -> {title, master (videas HLS), alt[] (rumble HLS mirror + direct MP4s), poster, preview, thumbs, skip markers, dl}; SoftSub adds subs[] (ASS) + fonts[]. playerUrl = full iframe src (player.animotv.ru or /plyr-player/, /jw-player/, /vidstack-player/, each with a base64 config in the URL). All servers: the episode op.",
+      "request": {
+        "method": "GET",
+        "url": "https://animotvslash.org/%7Bslug%7D/",
+        "headers": {
+          "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+          "accept-language": "en-US,en;q=0.9",
+          "priority": "u=0, i",
+          "sec-ch-ua": "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"",
+          "sec-ch-ua-mobile": "?0",
+          "sec-ch-ua-platform": "\"Linux\"",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+          "sec-fetch-site": "none",
+          "sec-fetch-user": "?1",
+          "upgrade-insecure-requests": "1",
+          "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        }
+      },
+      "slots": [
+        {
+          "param": "slug",
+          "at": [
+            "path:0"
+          ]
+        }
+      ],
+      "volatile": [],
+      "trigger": {
+        "url": "https://animotvslash.org/{slug}/"
+      },
+      "match": {
+        "method": "GET",
+        "host": "animotvslash.org",
+        "path": "/*/"
+      },
+      "response": {
+        "format": "html",
+        "contentType": "text/html; charset=UTF-8",
+        "pick": [
+          "config=playerUrl~player\\.animotv\\.ru/#([A-Za-z0-9_-]+)"
+        ],
+        "html": {
+          "items": "body",
+          "fields": {
+            "playerUrl": "#pembed iframe@src"
+          }
+        }
+      },
+      "params": [
+        {
+          "name": "slug",
+          "type": "string",
+          "required": true,
+          "example": "reincarnated-as-a-sword-season-2-episode-4"
+        }
+      ],
+      "readOnly": true,
+      "minTier": 1,
+      "learnedLoggedIn": false
+    }
+  ]
+}
