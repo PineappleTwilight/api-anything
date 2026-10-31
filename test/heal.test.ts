@@ -8,12 +8,14 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, describe, test } from "node:test";
+import { after, before, describe, test } from "node:test";
 import { browserAvailable, closeBrowser } from "../src/browser.js";
 import { call } from "../src/execute.js";
-import { addOperation } from "../src/heal.js";
+import { addOperation, type CaptureFile } from "../src/heal.js";
 import { parseSite } from "../src/spec.js";
-import { loadSite, saveSite, staleMark } from "../src/store.js";
+import { loadSite, markStale, saveSite, staleMark } from "../src/store.js";
+import type { Exchange } from "../src/types.js";
+import { type Fixture, startFixture } from "./fixture/server.js";
 
 const HOME = mkdtempSync(join(tmpdir(), "api-anything-heal-"));
 process.env.API_ANYTHING_HOME = HOME;
@@ -25,10 +27,133 @@ async function serve(handler: Parameters<typeof createServer>[1]): Promise<{ ser
   return { server, base: `http://127.0.0.1:${(server.address() as AddressInfo).port}` };
 }
 
+/** A capture of `page` as a browser makes it: the document, then the request its script sends. */
+async function captureOf(fx: Fixture, page: string, api: string): Promise<CaptureFile> {
+  const exchange = async (id: number, resourceType: string, path: string): Promise<Exchange> => {
+    const res = await fetch(`${fx.url}${path}`);
+    const body = await res.text();
+    const contentType = res.headers.get("content-type") ?? "";
+    return {
+      id,
+      resourceType,
+      request: { method: "GET", url: `${fx.url}${path}`, headers: {} },
+      response: { status: res.status, headers: { "content-type": contentType }, body, contentType },
+    };
+  };
+  const url = `${fx.url}${page}`;
+  return {
+    id: `c-heal-${captureCount++}`,
+    at: new Date().toISOString(),
+    url,
+    finalUrl: url,
+    cookies: [],
+    exchanges: [await exchange(1, "document", page), await exchange(2, "fetch", api)],
+  };
+}
+let captureCount = 0;
+
+describe("add: what it refuses to save, and what it doubts", () => {
+  let fx: Fixture;
+  before(async () => (fx = await startFixture()));
+  after(() => fx.close());
+
+  test("a server that answers both examples with the same data: saved with a warning, and marked unproven", async () => {
+    const r = await addOperation({
+      site: "stores",
+      op: "near",
+      examples: [{ city: "Sydney" }, { city: "Hobart" }],
+      from: { capture: await captureOf(fx, "/stores?city=Sydney", "/api/stores?city=Sydney") },
+      from2: await captureOf(fx, "/stores?city=Hobart", "/api/stores?city=Hobart"),
+      response: { extract: "stores" },
+    });
+    const w = r.warnings.find((x) => /example 1's data/.test(x));
+    assert.ok(w, r.warnings.join(" | "));
+    assert.match(w, /example 2 \(city=Hobart\) was answered with example 1's data/);
+    assert.match(w, /excludes something example 1 returned/);
+    assert.deepEqual(r.operation.unproven?.params, ["city"]);
+    assert.deepEqual(loadSite("stores")!.site.operations[0]!.unproven, r.operation.unproven);
+  });
+
+  test("examples answered with different data prove nothing is ignored: no mark", async () => {
+    const r = await addOperation({
+      site: "scoped",
+      op: "search",
+      examples: [{ q: "kittens" }, { q: "puppies" }],
+      from: { capture: await captureOf(fx, "/scoped?q=kittens", "/api/scoped?q=kittens") },
+      from2: await captureOf(fx, "/scoped?q=puppies", "/api/scoped?q=puppies"),
+    });
+    assert.equal(r.operation.unproven, undefined);
+    assert.equal(
+      r.warnings.some((x) => /example 1's data/.test(x)),
+      false,
+      r.warnings.join(" | "),
+    );
+  });
+
+  test("allowed values are set at add, must fit the examples, and stay with checks when the op is learned again", async () => {
+    const from = async () => ({ capture: await captureOf(fx, "/scoped?q=kittens", "/api/scoped?q=kittens") });
+    await assert.rejects(
+      addOperation({
+        site: "allowed",
+        op: "search",
+        examples: [{ q: "kittens" }],
+        from: await from(),
+        allowed: { q: { enum: ["cats", "dogs"] } },
+      }),
+      /example q=kittens is not a value q allows: it must be one of "cats", "dogs"/,
+    );
+    await assert.rejects(
+      addOperation({
+        site: "allowed",
+        op: "search",
+        examples: [{ q: "kittens" }],
+        from: await from(),
+        allowed: { page: { max: 5 } },
+      }),
+      /page is no param of search; its params are q/,
+    );
+    const r = await addOperation({
+      site: "allowed",
+      op: "search",
+      examples: [{ q: "kittens" }],
+      from: await from(),
+      allowed: { q: { enum: ["kittens", "puppies"] } },
+    });
+    assert.deepEqual(r.operation.params[0]!.enum, ["kittens", "puppies"]);
+    const site = loadSite("allowed")!.site;
+    site.operations[0]!.checks = [{ args: { q: "puppies" }, expect: "result" }];
+    saveSite(site);
+    const again = await addOperation({
+      site: "allowed",
+      op: "search",
+      examples: [{ q: "kittens" }],
+      from: await from(),
+    });
+    assert.deepEqual(again.operation.params[0]!.enum, ["kittens", "puppies"]);
+    assert.deepEqual(again.operation.checks, [{ args: { q: "puppies" }, expect: "result" }]);
+  });
+
+  test("an op learned from a sign-in page is not saved: add says to log in, then add again", async () => {
+    await assert.rejects(
+      addOperation({
+        site: "walled-add",
+        op: "secret",
+        examples: [{ q: "kittens" }],
+        from: { capture: await captureOf(fx, "/stores?city=x", "/private?q=kittens"), id: 2 },
+        response: { html: { items: "li", fields: { name: "" } } },
+      }),
+      /refusing to save .*sign-in page.*api-anything login walled-add.*then add again/,
+    );
+    assert.equal(loadSite("walled-add"), undefined);
+  });
+});
+
 describe("heal", { skip: !browserAvailable() && "no Chromium browser installed" }, () => {
   const servers: Server[] = [];
+  const fixtures: Fixture[] = [];
   after(async () => {
     await closeBrowser();
+    for (const f of fixtures) await f.close();
     for (const s of servers) {
       s.closeAllConnections();
       s.close();
@@ -102,6 +227,39 @@ fetch("/api/search?${key}="+encodeURIComponent(p.get("q"))+"&page="+encodeURICom
     const r = await call("s2", "search", { q: "cats", page: "2" }, fast);
     assert.equal(r.healed, true, JSON.stringify(r));
     assert.deepEqual((r.data as unknown[])[0], { q: "cats", page: "2" });
+  });
+
+  test("a recapture whose answer lost a picked field is not saved: the call is drift naming it", async () => {
+    let v2 = false;
+    const { server, base } = await serve((req, res) => {
+      const u = new URL(req.url!, "http://x");
+      const key = v2 ? "term" : "q";
+      if (u.pathname.startsWith("/api/")) {
+        if (!u.searchParams.has(key))
+          return void res.writeHead(400, { "content-type": "application/json" }).end('{"error":"unknown argument"}');
+        const q = u.searchParams.get(key);
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ results: [v2 ? { q, cost: 3 } : { q, price: 3 }] }));
+      }
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end(
+        `<html><body><script>fetch("/api/search?${key}="+encodeURIComponent(new URLSearchParams(location.search).get("q")))</script></body></html>`,
+      );
+    });
+    servers.push(server);
+    await addOperation({
+      site: "p1",
+      op: "search",
+      trigger: { url: `${base}/s?q={q}` },
+      examples: [{ q: "hello" }, { q: "world" }],
+      response: { extract: "results", pick: ["q", "price"] },
+    });
+    v2 = true;
+    const r = await call("p1", "search", { q: "cats" }, fast);
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.class, "drift");
+    assert.match(r.reason ?? "", /picked field price disappeared/);
+    assert.match(loadSite("p1")!.site.operations[0]!.request.url, /[?&]q=/, "the candidate was not saved");
   });
 
   test("a failed heal marks the op stale, so the next call skips the browser", async () => {
@@ -276,5 +434,95 @@ fetch("/api/"+"${QID.slice(0, 11)}"+"${QID.slice(11)}"+"/User?name="+location.pa
     assert.equal(r.class, "error");
     assert.match(r.reason ?? "", /heal stopped: the browser run failed/);
     assert.equal(staleMark("d", "get"), undefined);
+  });
+
+  // The trigger page is a bot challenge that never solves (about 15 s per run while it waits).
+  const challenged = async (name: string, over: Record<string, unknown> = {}) => {
+    const fx = await startFixture();
+    fixtures.push(fx);
+    saveSite(
+      parseSite({
+        name,
+        baseUrl: fx.url,
+        operations: [
+          {
+            name: "get",
+            readOnly: true,
+            request: { method: "GET", url: `${fx.url}/api/scoped?q=abc`, headers: {} },
+            slots: [{ param: "q", at: ["query:q"] }],
+            trigger: { url: `${fx.url}/challenged?q={q}` },
+            match: { method: "GET", path: "/api/scoped" },
+            params: [{ name: "q", example: "abc" }],
+            response: { extract: "data.items" }, // gone from the answer: drift
+            ...over,
+          },
+        ],
+      }),
+    );
+  };
+  const walled = (r: Awaited<ReturnType<typeof call>>) => {
+    assert.equal(r.class, "blocked", JSON.stringify(r));
+    assert.match(r.reason ?? "", /bot challenge \(Cloudflare challenge page \(HTTP 403\)\)/);
+    assert.match(r.next ?? "", /clear the challenge/);
+    assert.deepEqual([r.nextCall?.action, r.nextCall?.mode, r.retry], ["login", "window", "after_fix"]);
+  };
+
+  test("a recapture that meets a challenge that never solves is blocked: the heal stops, and nothing is stale", async () => {
+    await challenged("cha");
+    const r = await call("cha", "get", { q: "xyz" }, fast);
+    walled(r);
+    assert.match(r.reason ?? "", /heal stopped/);
+    assert.equal(staleMark("cha", "get"), undefined);
+  });
+
+  test("a bare 403 at every tier says the site refuses this machine; the site is then left alone for a while", async () => {
+    const fx = await startFixture();
+    fixtures.push(fx);
+    saveSite(
+      parseSite({
+        name: "refusing",
+        baseUrl: fx.url,
+        operations: [
+          {
+            name: "get",
+            readOnly: true,
+            request: { method: "GET", url: `${fx.url}/api/shut-out?q=abc`, headers: {} },
+            slots: [{ param: "q", at: ["query:q"] }],
+            trigger: { url: `${fx.url}/shut-out?q={q}` },
+            match: { method: "GET", path: "/api/shut-out" },
+            params: [{ name: "q", example: "abc" }],
+            response: { extract: "items" },
+          },
+        ],
+      }),
+    );
+    const refused = () => fx.calls.filter((c) => c.path.startsWith("/api/shut-out")).length;
+    const r = await call("refusing", "get", { q: "xyz" }, fast);
+    assert.deepEqual([r.class, r.tier], ["blocked", 3], JSON.stringify(r));
+    assert.match(r.next ?? "", /refuses requests from this machine or network/);
+    assert.match(r.next ?? "", /api-anything login refusing --window/);
+    assert.doesNotMatch(r.next ?? "", /challenging/);
+    assert.deepEqual([r.nextCall?.action, r.nextCall?.mode], ["login", "window"]);
+    const sent = refused();
+    assert.ok(sent >= 3, `every tier was tried (${sent} requests)`);
+
+    const again = await call("refusing", "get", { q: "xyz" }, fast);
+    assert.equal(refused(), sent, "nothing sent, and no browser run, while the site cools down");
+    assert.equal(again.class, "blocked");
+    assert.ok(again.retryAfterMs! > 9 * 60_000, String(again.retryAfterMs));
+    assert.match(again.next ?? "", /login refusing --window \(a login ends the wait\)/);
+    assert.ok(again.ms < 1000, `answered at once (${again.ms} ms)`);
+  });
+
+  test("a tier-3 run that meets a challenge that never solves is blocked, and a stale op keeps its tier-3 try", async () => {
+    await challenged("chb", { minTier: 3, response: { extract: "data.results" } });
+    walled(await call("chb", "get", { q: "xyz" }, fast));
+    assert.equal(staleMark("chb", "get"), undefined);
+
+    await challenged("chc");
+    markStale("chc", "get", "heal failed earlier");
+    const r = await call("chc", "get", { q: "xyz" }, fast);
+    assert.equal(r.ok, false);
+    assert.notEqual(staleMark("chc", "get")?.tier3, false, "a challenge is no proof the trigger does not answer");
   });
 });

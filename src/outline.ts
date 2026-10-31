@@ -4,8 +4,8 @@
  * site-specific rules: JSON outlines, JSON embedded in a page (JSON-LD, __NEXT_DATA__, state
  * assignments), and repeated HTML items that carry an example value.
  */
-import { type HTMLElement, parse as parseHtml } from "node-html-parser";
-import { extractEmbedded, getPath, innerJson, parseBody } from "./extract.js";
+import type { HTMLElement } from "node-html-parser";
+import { extractEmbedded, getPath, innerJson, parseBody, parseShown } from "./extract.js";
 import { suggestExtract } from "./learn.js";
 
 export type JsonOutline = {
@@ -163,13 +163,18 @@ function nameFor(el: HTMLElement, used: Set<string>, attr?: string): string {
     (stableTestid(el.getAttribute("data-testid")) ? el.getAttribute("data-testid") : undefined) ??
     (el.getAttribute("class") ?? "").split(/\s+/).filter(stableClass).at(-1) ??
     tag(el);
-  // the last two words name it: "book-item-ratings-count" -> ratingsCount, "BookStats__rating" -> bookStatsRating
+  // the last two words name it: "book-item-ratings-count" -> ratingsCount, "BookStats__rating" -> bookStatsRating;
+  // a microformat's prefix is no word ("u-url", "p-name", "dt-published")
   const words = raw
+    .replace(/^(?:h|p|u|dt|e)-/, "")
     .split(/[^A-Za-z0-9]+|(?<=[a-z])(?=[A-Z])/)
     .filter(Boolean)
     .slice(-2);
   let base = words.map((w, i) => (i ? w[0]!.toUpperCase() + w.slice(1) : w.toLowerCase())).join("") || tag(el);
-  if (attr === "href") base = `${base}Url`;
+  // a link classed as the link: its text is the title and its href the url ("u-url", "story-link")
+  const linkish = tag(el) === "a" && /(?:^|[a-z])(?:url|link|href)$/i.test(base);
+  if (linkish) base = attr === "href" ? "url" : "title";
+  else if (attr === "href") base = /url$/i.test(base) ? base : `${base}Url`;
   if (attr === "src") base = `${base}Image`;
   if (attr === "aria-label") base = `${base}Label`;
   let name = base,
@@ -297,7 +302,7 @@ export function outline(contentType: string, body: string, examples: string[]): 
     // JSON-LD is small and schema.org-stable, so it is always worth showing; other blocks only when they carry an example
     return o.at || regex.startsWith("application/ld") ? [{ regex, ...o }] : [];
   });
-  const root = parseHtml(body);
+  const root = parseShown(body);
   const list = values.length ? outlineHtmlList(root, values) : undefined;
   const labels = list ? undefined : outlineLabels(root);
   return {

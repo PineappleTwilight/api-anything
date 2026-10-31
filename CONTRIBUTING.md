@@ -1,15 +1,16 @@
 # Contributing
 
-## Adding a site spec
+## Adding a site
 
-Bundled specs live in `sites/<site>.json`, one file per site. A user's own copy in
-`~/.api-anything/sites/` always wins over the bundled one, and a heal writes a user copy. So a
-bundled spec is a starting point that each user's machine keeps healing. `sites/` on `main` is also
-the registry: once a spec merges, anyone can `api-anything pull <site>` it without a release.
+You don't need a pull request to add a site. Sites live in the registry service (docs/REGISTRY.md):
+when your agent learns a public read (`learn_site` over MCP, `api-anything learn` in a shell), it is
+shared as a candidate, and other installs' successful calls promote it. An op that needed a login, or
+that writes, is shared only when you run `api-anything publish <site> <op> --yes`, and a maintainer
+reviews it before anyone else gets it.
 
-The short way: after step 2 below, `api-anything publish <site> --keep-examples` previews what would
-be public and checks it against the shared rules; `--yes` then opens the pull request for you with
-the GitHub CLI. The steps below are the same thing by hand.
+`sites/` in this repository is the seed corpus: specs maintainers seeded into the registry, and the
+offline fallback the npm package ships. Changes to it are pull requests like any code. The steps below
+are how to polish a site by hand, for `sites/` or before you publish one:
 
 1. Learn the ops locally:
    ```sh
@@ -72,13 +73,28 @@ verbatim, plus these fields:
 
 ```sh
 npm install
+npm run cli -- <command>  # the CLI from source, e.g. npm run cli -- ops hacker-news
 npm run format  # Biome: format and apply safe lint fixes
 npm run lint    # what CI runs: formatting and lint, no changes
 npm run check   # typecheck src and test
 npm test        # unit + offline e2e (the browser parts skip when no Chromium browser is installed)
+npm run build   # compile src to dist/ (npm install runs it too, through prepare)
+npm run demo -- 'agent memory'  # examples/research.mjs against Hacker News (live site)
+npm run smoke:pack  # pack, install the tarball in a temp dir, run its CLI and library (needs the npm registry)
 ```
 
-CI runs `lint`, `check` and `test` on every pull request.
+CI runs `lint`, `check`, `test` with `REQUIRE_BROWSER=1` (a missing Chrome fails the run instead
+of skipping the browser tests) and `smoke:pack` on Node 22 and 24, and a gitleaks secret scan of the
+working tree and the full history on every pull request, a fork's included. The scan uses
+`.gitleaks.toml`: gitleaks' default rules, with a few fake test values allowed by exact value. A
+test that needs a provider-key shape should build it at run time rather than add an exception.
+The `CI` job passes only when every other job did, so it is the one to require.
+
+To release, a maintainer bumps `version` in `package.json` in a pull request, merges it once CI is
+green, then tags that commit and pushes the tag (`git tag -a v0.4.0 -m "api-anything 0.4.0" &&
+git push origin v0.4.0`). `.github/workflows/release.yml` publishes it to npm through trusted
+publishing: no npm token exists, and the package carries provenance. Running that workflow by hand
+is a dry run.
 
 Tests never touch real websites. `test/fixture/server.ts` imitates the patterns that matter:
 rotating GraphQL ids, layered form encoding, login walls, rate limits, signatures, and HTML

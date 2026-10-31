@@ -1,19 +1,28 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { OMITTED } from "../src/secrets.js";
+import { saveSession } from "../src/session.js";
 import type { Site } from "../src/spec.js";
 import {
   appendHeal,
+  beginWrite,
+  clearCoolDown,
   clearStale,
+  coolDown,
+  cooling,
   lastHealAt,
   listSites,
   loadSite,
   markStale,
   rememberedTier,
   rememberTier,
+  reserveSend,
   saveSite,
+  settleWrite,
   siteNotes,
   staleList,
   staleMark,
@@ -76,20 +85,20 @@ test("site notes stop at the Maintainer notes heading; the user's copy wins", ()
     join(bundled, "demo.md"),
     "Airport codes only.\n\n- First page only.\n\n## Maintainer notes\n\nVerified 2026-09-27.\n\n## How it works\n\nA POST.\n",
   );
-  assert.equal(siteNotes("demo", bundled), "Airport codes only.\n\n- First page only.");
+  assert.equal(siteNotes("demo", { bundledDir: bundled }), "Airport codes only.\n\n- First page only.");
   // only that heading on a line of its own ends the notes
   const whole =
     "See ## Maintainer notes below.\n\n## Maintainer notes for callers\n\n## Known limits\n\nFirst page only.";
   writeFileSync(join(bundled, "whole.md"), `${whole}\n`);
-  assert.equal(siteNotes("whole", bundled), whole);
+  assert.equal(siteNotes("whole", { bundledDir: bundled }), whole);
   writeFileSync(join(bundled, "internal.md"), "## Maintainer notes\n\nNothing for callers.\n");
-  assert.equal(siteNotes("internal", bundled), "");
-  assert.equal(siteNotes("missing", bundled), undefined);
+  assert.equal(siteNotes("internal", { bundledDir: bundled }), "");
+  assert.equal(siteNotes("missing", { bundledDir: bundled }), undefined);
 
   // a user's own file, with the heading capitalized another way
   mkdirSync(join(home, "sites"), { recursive: true });
   writeFileSync(join(home, "sites", "demo.md"), "Mine.\n\n## Maintainer Notes\n\nMy own history.\n");
-  assert.equal(siteNotes("demo", bundled), "Mine.");
+  assert.equal(siteNotes("demo", { bundledDir: bundled }), "Mine.");
 });
 
 test("heal log appends JSONL and records the heal time", () => {
@@ -120,6 +129,70 @@ test("stale marks expire after their TTL and carry a reason; tiers are remembere
   assert.equal(rememberedTier("x", "getUser"), undefined);
   rememberTier("x", "getUser", 2);
   assert.equal(rememberedTier("x", "getUser"), 2);
+});
+
+test("a stale mark and the heal log never keep a live session value", () => {
+  const { home } = fresh();
+  const live = "Qa7Ws2Ed9Rf4Tg6Yh1Uj";
+  saveSession("x", {
+    cookies: [{ name: "sid", value: live, domain: "x.test", path: "/", expires: -1, httpOnly: true, secure: true }],
+    values: {},
+  });
+  markStale("x", "getUser", `heal failed: HTTP 401: bad session ${live}`);
+  assert.equal(staleMark("x", "getUser")?.reason, "heal failed: HTTP 401: bad session [redacted]");
+  appendHeal({ site: "x", op: "getUser", strategy: "recapture", diff: `token ${encodeURIComponent(live)} -> ref` });
+  const log = readFileSync(join(home, "heals.jsonl"), "utf8");
+  assert.ok(!log.includes(live) && log.includes("[redacted]"), log);
+  // an encoding the replacements miss: the response is left out
+  markStale("x", "getUser", `heal failed: HTTP 401: bad session %25${live.charCodeAt(0).toString(16)}${live.slice(1)}`);
+  assert.equal(staleMark("x", "getUser")?.reason, `heal failed: ${OMITTED}`);
+});
+
+test("write ledger: an unsettled write holds back its repeat, under a local key and without the args", () => {
+  const { home } = fresh();
+  const args = { comment: "nice post" };
+  const first = beginWrite("x", "comment", args, {}, 1000);
+  assert.equal(first.send, true);
+  // the same args in another key order are the same write; it is still "sending"
+  const repeat = beginWrite("x", "comment", { ...args }, {}, 2000);
+  assert.deepEqual([repeat.send, !repeat.send && repeat.why], [false, "duplicate"]);
+  assert.equal(beginWrite("x", "comment", { comment: "other" }, {}, 2000).send, true);
+  assert.equal(beginWrite("x", "comment", args, { again: true }, 2000).send, true);
+  if (first.send) settleWrite(first.id, "not_applied", { ok: false, class: "auth" });
+
+  const text = readFileSync(join(home, "writes.json"), "utf8");
+  assert.ok(!text.includes("nice post") && !text.includes("other"), text);
+  assert.equal(statSync(join(home, "writes.json")).mode & 0o777, 0o600);
+  assert.equal(statSync(join(home, "write.key")).mode & 0o777, 0o600);
+  // another machine's key gives another digest: the digest cannot be checked against guessed args elsewhere
+  const digest = (JSON.parse(text) as { digest: string }[])[0]!.digest;
+  writeFileSync(join(home, "write.key"), "00".repeat(32));
+  beginWrite("x", "comment", args, { again: true }, 3000);
+  const after = JSON.parse(readFileSync(join(home, "writes.json"), "utf8")) as { digest: string }[];
+  assert.notEqual(after.at(-1)!.digest, digest);
+  // older than a day: dropped
+  beginWrite("x", "other", {}, {}, 3000 + 25 * 60 * 60_000);
+  assert.equal(JSON.parse(readFileSync(join(home, "writes.json"), "utf8")).length, 1);
+});
+
+test("write ledger: processes racing to send the same write let exactly one through", async () => {
+  const { home } = fresh();
+  const store = new URL("../src/store.ts", import.meta.url).href;
+  const script = `const { beginWrite } = await import(${JSON.stringify(store)}); process.stdout.write(String(beginWrite("x", "vote", { id: 7 }).send));`;
+  const runs = Array.from(
+    { length: 6 },
+    () =>
+      new Promise<string>((resolve, reject) => {
+        execFile(
+          process.execPath,
+          ["--import", "tsx", "--input-type=module", "-e", script],
+          { env: { ...process.env, API_ANYTHING_HOME: home } },
+          (e, out) => (e ? reject(e) : resolve(out)),
+        );
+      }),
+  );
+  const sent = await Promise.all(runs);
+  assert.equal(sent.filter((s) => s === "true").length, 1, sent.join(","));
 });
 
 test("secret scan: exact live values are secrets; heuristics only warn, and URL paths do not trip them", async () => {
@@ -234,4 +307,47 @@ test("export: shapes and typed example values stripped, examples kept on request
   assert.deepEqual(exportSite("demo").secrets, [
     "$.operations[0].request.headers.authorization holds the live session value authorization",
   ]);
+});
+
+test("export refuses a hand-written step that types a password, which no live session holds", async () => {
+  const { exportSite } = await import("../src/store.js");
+  fresh();
+  const op = site("x").operations[0]!;
+  const steps = [{ action: "fill" as const, selector: "#pw", value: "Hunter2-RealPassw0rd!" }];
+  saveSite({ ...site("x"), operations: [{ ...op, trigger: { ...op.trigger, steps } }] });
+  assert.deepEqual(exportSite("demo").secrets, [
+    "$.operations[0].trigger steps[0] fills a password or one-time-code field (#pw): a sign-in is the user's: ask them to run api-anything login <site> (it imports the cookies of the browser they are signed in with, no password)",
+  ]);
+});
+
+test("send slots: each moves the site's next send on by the interval ±30%, kept on disk, any one corrupt file aside", () => {
+  const { home } = fresh();
+  const now = 1_000_000;
+  const at = [reserveSend("a", 1000, now)];
+  for (let i = 0; i < 20; i++) at.push(reserveSend("a", 1000, now));
+  const gaps = at.slice(1).map((t, i) => t - at[i]!);
+  assert.equal(at[0], now, "an idle site sends at once");
+  assert.ok(
+    gaps.every((g) => g >= 700 && g <= 1300),
+    gaps.join(","),
+  );
+  assert.ok(new Set(gaps).size > 1, "not one fixed period");
+  assert.equal(reserveSend("b", 1000, now), now, "another site has its own slot");
+  // another process reads the same slot
+  assert.equal(JSON.parse(readFileSync(join(home, "pace.json"), "utf8")).a > at.at(-1)!, true);
+  writeFileSync(join(home, "pace.json"), "{not json");
+  assert.equal(reserveSend("a", 1000, now), now);
+});
+
+test("cool-downs: one per site, until it runs out or a login clears it; the wait is capped", () => {
+  fresh();
+  const now = Date.now();
+  coolDown("Demo", { class: "rate", reason: "HTTP 429" }, 60_000, now);
+  assert.deepEqual(cooling("demo", now + 1)?.class, "rate");
+  assert.equal(cooling("demo", now + 60_001), undefined);
+  coolDown("demo", { class: "blocked", reason: "x", status: 451 }, 365 * 24 * 3600_000, now);
+  assert.equal(cooling("demo", now)?.until, now + 30 * 60_000);
+  assert.equal(cooling("demo", now)?.status, 451);
+  clearCoolDown("demo");
+  assert.equal(cooling("demo", now), undefined);
 });

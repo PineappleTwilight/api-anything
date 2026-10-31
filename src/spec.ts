@@ -27,6 +27,11 @@ export const SlotSchema = z
       .string()
       .regex(/^(cookie|session):.+/, "ref must be cookie:<name> or session:<name>")
       .optional(),
+    /**
+     * a value the page makes for each request (an idempotency key from crypto.randomUUID()): a new one
+     * per call, the same on that call's retries, derived from the caller's idempotency key when given
+     */
+    gen: z.literal("uuid").optional(),
     at: z.array(Step).min(1),
     /** the leaf's text with `{param}` where the value goes (value is a substring of the leaf) */
     template: z.string().optional(),
@@ -34,7 +39,11 @@ export const SlotSchema = z
     /** with a template: how the value is escaped inside the leaf (see codec.ts Escape) */
     escape: z.enum(["url", "json"]).optional(),
   })
-  .refine((s) => (s.param === undefined) !== (s.ref === undefined), "a slot needs exactly one of param or ref");
+  .refine(
+    (s) => [s.param, s.ref, s.gen].filter((x) => x !== undefined).length === 1,
+    "a slot needs exactly one of param, ref or gen",
+  )
+  .refine((s) => s.gen === undefined || s.template === undefined, "a gen slot fills its whole leaf: no template");
 
 export const VolatileSchema = z.object({
   at: z.array(Step).min(1),
@@ -53,12 +62,10 @@ export const TriggerStepSchema = z.object({
   ms: z.number().optional(),
 });
 
-export const TriggerSchema = z.object({
-  /** URL template, `{param}` filled from args */
-  url: z.string(),
-  steps: z.array(TriggerStepSchema).optional(),
-  /** neutral page to load first, then soft-navigate to `url` */
-  softFrom: z.string().optional(),
+/** A confirm() a write's learning accepted: the step it came at (-1: before the first) and its digest (confirm.ts). */
+export const ConfirmSchema = z.object({
+  step: z.number().int().min(-1),
+  digest: z.string().regex(/^[0-9a-f]{64}$/, "digest must be 64 lowercase hex characters"),
 });
 
 /** Stable request identity only. Never a queryId/doc_id/hash. */
@@ -68,6 +75,21 @@ export const MatchSchema = z.object({
   /** pathname with `*` for any one segment */
   path: z.string().optional(),
   operationName: z.string().optional(),
+});
+
+export const TriggerSchema = z.object({
+  /** URL template, `{param}` filled from args */
+  url: z.string(),
+  steps: z.array(TriggerStepSchema).optional(),
+  /** neutral page to load first, then soft-navigate to `url` */
+  softFrom: z.string().optional(),
+  /** a write's confirm() dialogs that a tier-3 run accepts when the page asks them again; any other is dismissed */
+  confirms: z.array(ConfirmSchema).optional(),
+  /**
+   * a write's other unsafe requests its learning saw the trigger send (the cart saved before the
+   * order), each by its stable identity: a tier-3 run stops any other. Absent: learned before this.
+   */
+  companions: z.array(MatchSchema).optional(),
 });
 
 function validRegex(p: string): boolean {
@@ -104,18 +126,84 @@ export const ResponseSchema = z.object({
   embedded: z.object({ regex: z.string() }).optional(),
 });
 
-export const ParamSchema = z.object({
-  name: z.string().min(1),
-  type: z.enum(["string", "number", "boolean", "object", "array"]).default("string"),
-  required: z.boolean().default(true),
-  description: z.string().optional(),
-  example: z.unknown().optional(),
-  default: z.unknown().optional(),
-  /** a regex the whole value must match; a call with an arg that doesn't is `input`, and nothing is sent */
-  pattern: z.string().refine(validRegex, "pattern must be a valid regular expression").optional(),
-  /** what a valid value looks like, said to the agent when an arg fails `pattern` ("YYYY-MM-DD") */
-  hint: z.string().optional(),
+export const ParamSchema = z
+  .object({
+    name: z.string().min(1),
+    type: z.enum(["string", "number", "boolean", "object", "array"]).default("string"),
+    required: z.boolean().default(true),
+    description: z.string().optional(),
+    example: z.unknown().optional(),
+    default: z.unknown().optional(),
+    /** a regex the whole value must match; a call with an arg that doesn't is `input`, and nothing is sent */
+    pattern: z.string().refine(validRegex, "pattern must be a valid regular expression").optional(),
+    /** what a valid value looks like, said to the agent when an arg fails `pattern` ("YYYY-MM-DD") */
+    hint: z.string().optional(),
+    /** the site's whole set of values for it (not just the example's); any other is `input`, and nothing is sent */
+    enum: z.array(z.string()).min(1).optional(),
+    /** bounds on the value read as a number; a value outside them, or not a number, is `input` */
+    min: z.number().optional(),
+    max: z.number().optional(),
+  })
+  .refine((p) => p.min === undefined || p.max === undefined || p.min <= p.max, "a param's min is above its max");
+
+/** A call a human confirmed, and what the site answers it with: data, no data, or a refusal of the args. */
+export const CheckSchema = z.object({
+  args: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])),
+  expect: z.enum(["result", "empty", "input"]),
+  /** why this case: which value excludes what ("open=no leaves out the open store in example 1") */
+  purpose: z.string().optional(),
 });
+
+/** How a read's list continues: the param that takes the next page, and where the answer says what that is. */
+export const PagingSchema = z.object({
+  /** the param a call sets to get the next page: a cursor, or a page number */
+  param: z.string().min(1),
+  /**
+   * path in the whole answer (before `extract`; for `embedded`, the embedded JSON) to the next page's
+   * cursor or number. Without it the pages are numbered and the answer says nothing about the next one.
+   */
+  next: z.string().min(1).optional(),
+});
+
+/** the read's args */
+const ReadbackArgs = z.record(z.string(), z.string()).default({});
+/** an item of the read's answer (or the answer itself) whose `field` equals `equals`; without it, any data counts */
+const ReadbackFind = z.object({ field: z.string().min(1), equals: z.string() }).optional();
+
+/**
+ * How a write's call proves it landed: one read of the same site, run once after the write was sent.
+ * Every value may hold `{writeParam}`, filled from the write's args. A local spec names the read
+ * (`op`); a shared one carries its request (`read`), since an upload holds one op. The outer objects
+ * are strict, so neither shape passes for the other.
+ */
+export const ReadbackSchema = z.union([
+  z.strictObject({
+    /** a read op of the same site */
+    op: z.string().min(1),
+    args: ReadbackArgs,
+    find: ReadbackFind,
+  }),
+  z.strictObject({
+    /** the read as it was published: `name` is a label, no op the site has to hold */
+    // not strict: a field a later client adds to the read is dropped, not a parse failure of the whole site
+    read: z.object({
+      name: z.string().min(1),
+      request: RequestSchema,
+      slots: z.array(SlotSchema).default([]),
+      volatile: z.array(VolatileSchema).default([]),
+      trigger: TriggerSchema,
+      match: MatchSchema.default({}),
+      response: ResponseSchema.default({ format: "json" }),
+      params: z.array(ParamSchema).default([]),
+      public: z.array(z.string()).optional(),
+      minTier: z.union([z.literal(1), z.literal(2), z.literal(3)]).default(1),
+      learnedLoggedIn: z.boolean().default(false),
+      paging: PagingSchema.optional(),
+    }),
+    args: ReadbackArgs,
+    find: ReadbackFind,
+  }),
+]);
 
 export const OperationSchema = z.object({
   name: z.string().min(1),
@@ -136,6 +224,23 @@ export const OperationSchema = z.object({
   minTier: z.union([z.literal(1), z.literal(2), z.literal(3)]).default(1),
   learnedLoggedIn: z.boolean().default(false),
   learnedAt: z.string().optional(),
+  /** run by `verify` beside the examples; `publish` refuses while one fails */
+  checks: z.array(CheckSchema).optional(),
+  /** a read's list pages: a call returns the next page's cursor (nextPage), and verify checks page 2 is not page 1 again */
+  paging: PagingSchema.optional(),
+  /** a write's proof: a read run once after it is sent; finding it makes the call's `write` "applied" */
+  readback: ReadbackSchema.optional(),
+  /**
+   * Learning could not show these params change the answer: example 2, which gave them other values,
+   * was answered with example 1's data. `publish` refuses while it is set; a `verify` clears it when
+   * two of its passing cases that differ only in these params answer differently.
+   */
+  unproven: z.object({ params: z.array(z.string()), reason: z.string() }).optional(),
+  /**
+   * The registry version this op is (its hash) and the status the registry gave it, set by `pull` and
+   * `shareOps`. This machine's record, like `learnedAt`: never uploaded, hashed or exported.
+   */
+  version: z.object({ hash: z.string(), status: z.string() }).optional(),
 });
 
 export const SiteSchema = z.object({
@@ -151,18 +256,27 @@ export const SiteSchema = z.object({
    * saved now (a heal writes a user copy): it is checked against the shared rules on every load,
    * and its heals do not rescan.
    */
-  shared: z.object({ from: z.string(), sha256: z.string() }).optional(),
+  shared: z.object({ from: z.string(), sha256: z.string(), by: z.literal("agent").optional() }).optional(),
 });
 
 export type Request = z.infer<typeof RequestSchema>;
 export type Slot = z.infer<typeof SlotSchema>;
 export type Volatile = z.infer<typeof VolatileSchema>;
 export type Trigger = z.infer<typeof TriggerSchema>;
+export type Confirm = z.infer<typeof ConfirmSchema>;
 export type Match = z.infer<typeof MatchSchema>;
 export type ResponseSpec = z.infer<typeof ResponseSchema>;
 export type Param = z.infer<typeof ParamSchema>;
+export type Check = z.infer<typeof CheckSchema>;
+export type Paging = z.infer<typeof PagingSchema>;
+export type Readback = z.infer<typeof ReadbackSchema>;
+export type ReadbackRef = Extract<Readback, { op: string }>;
+export type ReadbackRead = Extract<Readback, { read: unknown }>["read"];
 export type Operation = z.infer<typeof OperationSchema>;
 export type Site = z.infer<typeof SiteSchema>;
+
+/** The name a readback's read goes by: the op it names, or the label of the one it carries. */
+export const readbackName = (rb: Readback) => ("op" in rb ? rb.op : rb.read.name);
 
 export function parseSite(input: unknown): Site {
   const r = SiteSchema.safeParse(input);

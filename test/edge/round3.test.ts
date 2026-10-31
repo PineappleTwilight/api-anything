@@ -488,13 +488,14 @@ describe("agent surface", () => {
       mcpNext("check the args against: api-anything ops linkedin; do not heal or re-add"),
       'check the args against: list_operations {"site":"linkedin"}; do not heal or re-add',
     );
+    // x was never imported: the login tool could not refresh it (mcp.test.ts has the imported case)
     assert.match(
       mcpNext("ask the user to run: api-anything login x; then retry once"),
-      /^the login tool \{"site":"x"\}/,
+      /^ask the user to run in a terminal: api-anything login x \(.*no password\).*--window.*; then retry once$/,
     );
     assert.match(
       mcpNext("api-anything heal x getUser; if that fails, re-learn it with api-anything add x getUser ..."),
-      /is a CLI: run it in your shell, as npx -y github:goodnight000\/api-anything when the command is not installed; with no shell, ask the user\)$/,
+      /is a CLI: run it in your shell, as npx -y api-anything when the command is not installed; with no shell, ask the user\)$/,
     );
     assert.equal(mcpNext("api-anything sites lists what exists"), "list_sites lists what exists");
     assert.doesNotMatch(
@@ -505,7 +506,7 @@ describe("agent surface", () => {
     );
   });
 
-  test("over MCP, call_operation's next and list_operations' notes and param hints", async () => {
+  test("over MCP, call_operation's next and list_operations' notes and param formats", async () => {
     const home = newHome();
     saveSite(
       parseSite({
@@ -533,7 +534,11 @@ describe("agent surface", () => {
         JSON.parse((r.content as { text: string }[])[0]!.text);
       const ops = text(await client.callTool({ name: "list_operations", arguments: { site: "notes" } }));
       assert.match(ops.notes, /Airport codes only/);
-      assert.equal(ops.operations[0].params[0].hint, "a date as YYYY-MM-DD");
+      assert.deepEqual(ops.operations[0].inputSchema.properties.d, {
+        type: "string",
+        description: "a date as YYYY-MM-DD",
+        pattern: "^(?:\\d{4}-\\d{2}-\\d{2})$",
+      });
       const bad = text(
         await client.callTool({
           name: "call_operation",
@@ -711,20 +716,17 @@ describe("browser", { skip: noChrome }, () => {
     }, "localhost");
     const a = await listen((req, res) => {
       const u = new URL(req.url ?? "/", "http://x");
+      // a persisted query sent as GET (Apollo's): a POST one would be stopped as a possible write
       if (u.pathname === "/api/graphql") {
-        let s = "";
-        req.on("data", (d) => (s += d));
-        req.on("end", () => {
-          const q = Buffer.from(JSON.parse(s).v, "base64").toString();
-          res.writeHead(200, { "content-type": "application/json" });
-          res.end(JSON.stringify({ data: { results: [{ name: `${q} one` }, { name: `${q} two` }] } }));
-        });
+        const q = Buffer.from(u.searchParams.get("v") ?? "", "base64").toString();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: { results: [{ name: `${q} one` }, { name: `${q} two` }] } }));
         return;
       }
       html(
         res,
         `<input id=q><div id=out></div><script>document.getElementById('q').addEventListener('keydown', async (e) => { if (e.key !== 'Enter') return; const q = e.target.value;
-          const r = await fetch('/api/graphql', { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ id: 'a1b2c3', v: btoa(q) }) });
+          const r = await fetch('/api/graphql?id=a1b2c3&v=' + encodeURIComponent(btoa(q)));
           document.getElementById('out').textContent = JSON.stringify(await r.json());
           history.pushState({}, '', '/search?q=' + encodeURIComponent(q));
           fetch('${b.base}/v1/p', { method: 'POST', headers: {'content-type':'text/plain'}, body: JSON.stringify({ event: 'search', properties: { search: location.search }, context: { page: { url: location.href } } }) });
@@ -755,6 +757,8 @@ describe("browser", { skip: noChrome }, () => {
         /no captured request carries|answers without data/,
       );
       assert.equal(loadSite("spa"), undefined, "nothing was saved");
+      // the beacon is a POST its steps send: stopped while a read is learned, it never left
+      assert.equal(beacons.length, 1, "only the plain run's beacon left");
     } finally {
       for (const s of [a.server, b.server]) {
         s.closeAllConnections();
@@ -774,10 +778,11 @@ describe("browser", { skip: noChrome }, () => {
         }, 700);
         return;
       }
-      // the origin page navigates itself once, shortly after load (an interstitial's redirect)
+      // the origin page navigates itself once (an interstitial's redirect) while the fetch is in
+      // flight: timed from the fetch, since a timer from load can fire before a busy machine sends it
       html(
         res,
-        `<script>if(!sessionStorage.getItem("n")){sessionStorage.setItem("n","1");setTimeout(()=>location.href="/?again=1",150)}</script>`,
+        `<script>const f=fetch;fetch=(...a)=>{if(!sessionStorage.getItem("n")){sessionStorage.setItem("n","1");setTimeout(()=>location.href="/?again=1",150)}return f(...a)}</script>`,
       );
     });
     try {

@@ -130,7 +130,7 @@ export function splitPick(s: string): string[] {
   return out;
 }
 
-function pickEntry(p: string): { name: string; path: string; re?: RegExp } {
+export function pickEntry(p: string): { name: string; path: string; re?: RegExp } {
   const [, name, rest] = /^([\w$-]+)=(.+)$/.exec(p) ?? [p, undefined, p];
   const cut = rest.indexOf("~");
   const path = cut < 0 ? rest : rest.slice(0, cut);
@@ -193,6 +193,35 @@ const address = (v: string, attr: string, base: string): string => {
   }
 };
 
+const UNSHOWN_TAGS = new Set(["script", "style", "noscript", "template"]);
+const HIDDEN_STYLE =
+  /(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse))\s*(?:!\s*important\s*)?(?:;|$)/i;
+
+/**
+ * An element the page does not show: script, style, noscript or template, the `hidden` attribute
+ * (but `until-found`, a collapsed section a find reveals), or an inline display:none or
+ * visibility:hidden. Text an agent reads and the user never sees is where injected instructions
+ * hide. `aria-hidden` is shown: it hides from screen readers only, and is often the visible copy.
+ */
+function unshown(el: HTMLElement): boolean {
+  const hidden = el.getAttribute("hidden");
+  return (
+    UNSHOWN_TAGS.has(el.rawTagName?.toLowerCase() ?? "") ||
+    (hidden !== undefined && hidden.toLowerCase() !== "until-found") ||
+    HIDDEN_STYLE.test(el.getAttribute("style") ?? "")
+  );
+}
+
+/** The page parsed, without the elements it does not show; `<head>`'s `<base>` stays. */
+export function parseShown(body: string): HTMLElement {
+  const doc = parseHtml(body);
+  const stack = [doc];
+  for (let el = stack.pop(); el; el = stack.pop())
+    for (const c of [...el.childNodes])
+      if (c.nodeType === 1) unshown(c as HTMLElement) ? c.remove() : stack.push(c as HTMLElement);
+  return doc;
+}
+
 /** What a browser resolves the page's links against: its first `<base href>`, else its own address. */
 function documentBase(doc: HTMLElement, url: string): string {
   const href = doc.querySelector("base[href]")?.getAttribute("href");
@@ -214,7 +243,7 @@ export function extractHtml(
   recipe: { items: string; fields: Record<string, string> },
   base?: string,
 ): Record<string, string | string[] | undefined>[] {
-  const doc = parseHtml(body);
+  const doc = parseShown(body);
   base &&= documentBase(doc, base);
   return doc.querySelectorAll(recipe.items).map((el) => {
     const out: Record<string, string | string[] | undefined> = {};
@@ -369,8 +398,12 @@ export function capOutput(value: unknown, maxChars = 20_000): { data: unknown; t
 // numeric ids, short upper-case codes (SFO, US), and ids with digits (item-85809106, u_123)
 const ID_KEY = /^(\d+|[A-Z0-9]{2,5}|[\w:.-]*\d[\w:.-]*)$/;
 
-/** Key paths -> types (first array item only; an id-keyed map as "*"), for drift detection. */
-export function inferShape(value: unknown, maxPaths = 200): Record<string, string> {
+/**
+ * Key paths -> types (first array item only; an id-keyed map as "*"), for drift detection.
+ * `optional` (a learned answer's): a path of a first item that another item of its list lacks is
+ * typed "null", as a value learned null is, so its absence later is no drift.
+ */
+export function inferShape(value: unknown, maxPaths = 200, optional = false): Record<string, string> {
   const out: Record<string, string> = {};
   let n = 0;
   const visit = (v: unknown, path: string, depth: number) => {
@@ -382,7 +415,20 @@ export function inferShape(value: unknown, maxPaths = 200): Record<string, strin
     }
     if (depth >= 6) return;
     if (Array.isArray(v)) {
-      if (v.length) visit(v[0], `${path}[]`, depth + 1);
+      if (!v.length) return;
+      const at = `${path}[]`;
+      const before = new Set(Object.keys(out));
+      visit(v[0], at, depth + 1);
+      if (!optional || v[0] === null || typeof v[0] !== "object") return;
+      const own = Object.keys(out).filter((k) => !before.has(k) && k !== at);
+      for (const item of v.slice(1)) {
+        if (item === null || typeof item !== "object") continue;
+        const has = inferShape(item, maxPaths);
+        for (const k of own) {
+          const rel = k.slice(at.length).replace(/^\./, "");
+          if (!(rel in has)) out[k] = "null";
+        }
+      }
     } else if (type === "object") {
       const entries = Object.entries(v as Record<string, unknown>);
       // An id-keyed map (airports: {SFO: {...}}) has different keys for other args: its keys are "*".

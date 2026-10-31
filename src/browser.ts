@@ -6,15 +6,16 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
-import type { BrowserContext, Cookie, chromium, Frame, Page, Request, Response, Route } from "playwright-core";
+import type { BrowserContext, Cookie, chromium, Dialog, Frame, Page, Request, Response, Route } from "playwright-core";
 import { botWall } from "./classify.js";
+import { SIGN_IN_AUTOCOMPLETE, SIGN_IN_REFUSAL } from "./secrets.js";
 import { home, siteOf, writePrivate } from "./session.js";
 import type { Request as Hop } from "./spec.js";
-import type { CaptureResult, Exchange, StoredCookie, TriggerStep } from "./types.js";
+import type { CaptureResult, Exchange, SeenDialog, StoredCookie, TriggerStep } from "./types.js";
 
 let current: { profileDir: string; headless: boolean; ctx: Promise<BrowserContext> } | undefined;
 let headlessUA: string | undefined;
-const originPages = new Map<string, Page>();
+const originPages = new Map<string, OriginPage>();
 
 // A browser locks a profile to one process. A long-lived process (the MCP server) releases it
 // after this much idle time (an agent's calls are seconds apart, so the browser would mostly
@@ -558,6 +559,12 @@ export interface TriggerOptions {
    * short settle instead of waiting for the whole page to go quiet
    */
   match?: (e: Exchange) => boolean;
+  /**
+   * whether to accept a confirm() a page of the run shows once its steps run (`step`: the step
+   * running, -1 before the first). Without it, and before the steps or after the run, a confirm is
+   * dismissed. Alerts and prompts are always dismissed, and leaving a page (beforeunload) accepted.
+   */
+  confirm?: (a: { message: string; origin: string; step: number }) => boolean;
   /** extra wait after the network first goes quiet (default 300) */
   settleMs?: number;
   /** overall budget; also the per-action Playwright timeout (default 30000) */
@@ -582,8 +589,22 @@ async function runStep(page: Page, s: TriggerStep): Promise<void> {
   switch (s.action) {
     case "click":
       return page.click(need(s.selector, "a selector"));
-    case "fill":
-      return page.fill(need(s.selector, "a selector"), s.value ?? "");
+    case "fill": {
+      const selector = need(s.selector, "a selector");
+      // asked of the page, not the selector: a password typed here would be saved in the spec
+      const field = await page.waitForSelector(selector, { state: "attached" });
+      const secret = await field
+        .evaluate((el, names) => {
+          const f = el instanceof HTMLLabelElement && el.control ? el.control : el;
+          const auto = (f.getAttribute("autocomplete") ?? "").toLowerCase().split(/\s+/);
+          return f.getAttribute("type")?.toLowerCase() === "password" || auto.some((t) => names.includes(t));
+        }, SIGN_IN_AUTOCOMPLETE)
+        .finally(() => field.dispose());
+      if (secret)
+        throw new Error(`trigger step fills a password or one-time-code field (${selector}): ${SIGN_IN_REFUSAL}`);
+      // by selector, as before: an app that re-renders the input between the two finds the new one
+      return page.fill(selector, s.value ?? "");
+    }
     case "press":
       return s.selector ? page.press(s.selector, need(s.value, "a key")) : page.keyboard.press(need(s.value, "a key"));
     case "wait":
@@ -594,6 +615,12 @@ async function runStep(page: Page, s: TriggerStep): Promise<void> {
       return goto(page, need(s.value ?? s.selector, "a url in value"));
   }
 }
+
+/**
+ * Answer a native dialog. A page waits on one, and Playwright leaves it to the listener once there
+ * is one: every dialog gets an answer, or the page hangs.
+ */
+const answer = (d: Dialog, accept: boolean) => void (accept ? d.accept() : d.dismiss()).catch(() => {});
 
 /** The request body as the server gets it: a gzip/deflate/br-encoded body (YouTube's innertube) decoded. */
 function requestBody(req: Request): string | undefined {
@@ -683,6 +710,28 @@ export async function runTrigger(o: TriggerOptions): Promise<CaptureResult> {
     return !asked || !(await within(asked, false)) || strays().length > 0;
   };
 
+  /** the native dialogs the run's pages showed */
+  const dialogs: SeenDialog[] = [];
+  /** the trigger step running: -1 before the first */
+  let step = -1;
+  /** set as the run ends: no confirm is accepted from then on */
+  let over = false;
+  const onDialog = (d: Dialog) => {
+    const type = d.type() as SeenDialog["type"];
+    const message = d.message();
+    let origin = "null";
+    try {
+      origin = new URL(d.page()?.url() ?? "").origin;
+    } catch {
+      /* no page left */
+    }
+    const accepted =
+      type === "beforeunload" || (type === "confirm" && acting && !over && !!o.confirm?.({ message, origin, step }));
+    dialogs.push({ type, message, origin, step, accepted });
+    answer(d, accepted);
+  };
+  page.on("dialog", onDialog);
+
   // This run's pages: its own and any popup they open. The context is shared with concurrent runs.
   const own = new Set<Page>([page]);
   const ownerOf = (req: Request): Page | undefined => {
@@ -711,6 +760,7 @@ export async function runTrigger(o: TriggerOptions): Promise<CaptureResult> {
     if ((opener && own.has(opener)) || (await stray(p))) {
       own.add(p);
       cover(p);
+      p.on("dialog", onDialog);
     }
     return own.has(p);
   };
@@ -992,11 +1042,19 @@ export async function runTrigger(o: TriggerOptions): Promise<CaptureResult> {
     acting = true;
     // steps typed into a challenge interstitial would time out on selectors the real page has
     if (o.steps?.length) await outwait();
-    for (const s of o.steps ?? []) await runStep(page, s);
+    for (const [i, s] of (o.steps ?? []).entries()) {
+      step = i;
+      await runStep(page, s);
+    }
     await waitForData();
     // A JS challenge (AWS WAF, Cloudflare) solves itself and reloads, often after a second or more:
     // judging now would take the interstitial for the page. Wait (bounded) for a real document.
     if (await outwait()) await waitForData();
+    const wait: NonNullable<CaptureResult["wait"]> = {
+      ended: o.match && answered() ? "answered" : Date.now() >= deadline ? "deadline" : "quiet",
+      open: pending.size,
+      ...(docs.at(-1)?.response ? { status: docs.at(-1)!.response!.status } : {}),
+    };
     // Bodies still arriving get a short grace, not the whole budget: a hung long poll is not the data.
     const grace = new Promise((r) => setTimeout(r, Math.min(5000, Math.max(0, deadline - Date.now()))).unref());
     const settled = (async () => {
@@ -1023,8 +1081,12 @@ export async function runTrigger(o: TriggerOptions): Promise<CaptureResult> {
       finalUrl: page.url(),
       storage,
       locations: [...locations],
+      // a copy: what a page shows while the run closes it is not the run's
+      ...(dialogs.length ? { dialogs: [...dialogs] } : {}),
+      wait,
     };
   } finally {
+    over = true;
     page.off("framenavigated", onNavigated);
     ctx.off("request", onRequest);
     ctx.off("requestfinished", onDone);
@@ -1055,6 +1117,37 @@ export async function runTrigger(o: TriggerOptions): Promise<CaptureResult> {
     }
     release();
   }
+}
+
+const ENDED = { answered: "the op's request answered", quiet: "the page went quiet", deadline: "the time ran out" };
+/** "at steps[1]", or before the first step */
+export const atStep = (step: number) => (step < 0 ? "before the steps" : `at steps[${step}]`);
+
+/**
+ * Why a run stopped waiting, in a line for a failure's reason: how the wait ended, where the page
+ * was (origin and path: a query can carry a token) and its document's status, the requests still
+ * open, and the dialogs it showed with their answers. Never page text or a cookie or header value.
+ */
+export function waitReport(c: CaptureResult): string {
+  let where = c.finalUrl;
+  try {
+    const u = new URL(c.finalUrl);
+    where = u.origin === "null" ? u.protocol + u.pathname : u.origin + u.pathname;
+  } catch {
+    /* kept as it is */
+  }
+  if (where.length > 120) where = `${where.slice(0, 120)}...`;
+  const w = c.wait;
+  const parts = [
+    `${w ? `${ENDED[w.ended]} ` : ""}on ${where}${w?.status !== undefined ? ` (HTTP ${w.status})` : ""}`,
+    ...(w ? [`${w.open} request${w.open === 1 ? "" : "s"} still open`] : []),
+  ];
+  const seen = c.dialogs ?? [];
+  if (seen.length) {
+    const said = seen.slice(0, 3).map((d) => `${d.type} ${d.accepted ? "accepted" : "dismissed"} ${atStep(d.step)}`);
+    parts.push(`dialogs: ${said.join(", ")}${seen.length > 3 ? ` and ${seen.length - 3} more` : ""}`);
+  }
+  return parts.join("; ");
 }
 
 export interface PageFetchResult {
@@ -1093,15 +1186,46 @@ async function redirectOf(seen: Response[], hop: Hop, url: string) {
   return { ...answers[0]!, body: "", url, location: answers[0]!.headers.location };
 }
 
+/** One tier-2 fetch's hold on the requests of the page it runs in. */
+interface Watch {
+  /** may this request be the fetch's own? Same method and origin: the page's own can look alike, which only errs toward "sent" */
+  mine(method: string, url: string): boolean;
+  /** one of them reached the browser and was let go */
+  started: boolean;
+  /** given up on before any was let go: each later one is failed in the browser, so none leaves */
+  sealed: boolean;
+}
+
+/** A cached tier-2 page and the fetches watching its requests. */
+interface OriginPage {
+  origin: string;
+  page: Page;
+  watches: Set<Watch>;
+  retired?: boolean;
+}
+
+/** A tier-2 fetch none of whose requests left the page, and none of which ever will. */
+class NotStarted extends Error {}
+
+/** Hand out a page no more, and close it once no fetch that may still be answered is using it. */
+function retire(e: OriginPage): void {
+  e.retired = true;
+  if (originPages.get(e.origin) === e) originPages.delete(e.origin);
+  if ([...e.watches].every((w) => w.sealed)) void within(e.page.close(), undefined);
+}
+
 /** A page on `origin` to fetch from: its root, or a blank stand-in when the root redirects elsewhere (api.* to www). */
-async function originPage(ctx: BrowserContext, origin: string, left: () => number): Promise<Page> {
-  let page = originPages.get(origin);
-  if (page && !page.isClosed()) {
-    if (new URL(page.url()).origin === origin) return page;
-    await within(page.close(), undefined, Math.min(SEAL_MS, left()));
+async function originPage(ctx: BrowserContext, origin: string, left: () => number): Promise<OriginPage> {
+  const kept = originPages.get(origin);
+  if (kept && !kept.page.isClosed()) {
+    if (new URL(kept.page.url()).origin === origin) return kept;
+    originPages.delete(origin);
+    await within(kept.page.close(), undefined, Math.min(SEAL_MS, left()));
     if (left() <= 1) throw new Error("the origin page could not be replaced before the call's deadline");
   }
-  page = await ctx.newPage();
+  const page = await ctx.newPage();
+  // the same answers as a trigger run's, with no confirm accepted: this page only fetches
+  page.on("dialog", (d) => answer(d, d.type() === "beforeunload"));
   await page.goto(origin, { waitUntil: "domcontentloaded", timeout: left() }).catch(() => {});
   let here = "";
   try {
@@ -1117,9 +1241,33 @@ async function originPage(ctx: BrowserContext, origin: string, left: () => numbe
     );
     await page.goto(blank, { waitUntil: "domcontentloaded", timeout: left() });
   }
-  originPages.set(origin, page);
-  return page;
+  // Every request the page sends waits in the browser until it is let go here. So a fetch none of
+  // whose requests was let go provably sent nothing, and one given up on can be kept from leaving
+  // later, when a stalled page wakes up.
+  const entry: OriginPage = { origin, page, watches: new Set() };
+  const cdp = await ctx.newCDPSession(page);
+  cdp.on("Fetch.requestPaused", ({ requestId, request }) => {
+    let drop = false;
+    for (const w of entry.watches)
+      if (w.mine(request.method, request.url)) {
+        if (w.sealed) drop = true;
+        else w.started = true;
+      }
+    void (
+      drop
+        ? cdp.send("Fetch.failRequest", { requestId, errorReason: "Aborted" })
+        : cdp.send("Fetch.continueRequest", { requestId })
+    ).catch(() => {}); // the page is gone
+  });
+  await cdp.send("Fetch.enable", { patterns: [{ urlPattern: "*" }] });
+  originPages.set(origin, entry);
+  return entry;
 }
+
+// How long a page has to hand its fetch to the browser. It takes milliseconds; a page that has not
+// by then is stalled (seen: a cached page whose renderer ran nothing until the next DevTools
+// command reached it, so its fetch waited out the whole deadline) and is replaced.
+const START_MS = 2000;
 
 /** Tier 2: fetch() from inside a page on the site origin, so TLS, cookies and sec-fetch are the browser's own. */
 export async function pageFetch(o: {
@@ -1142,23 +1290,36 @@ export async function pageFetch(o: {
    * another origin with every header and the body. `taken`: the redirects before this one, for
    * the caller's limit. Without it no redirect is followed, and the redirect itself is the answer.
    */
-  redirect?: (from: Hop, status: number, location: string, taken: number) => Hop;
+  redirect?: (from: Hop, status: number, location: string, taken: number) => Hop | Promise<Hop>;
+  /** "omit": send none of the profile's cookies (someone else's spec, a request that may change something) */
+  credentials?: "include" | "omit";
+  /** waits for the site's send slot, once Chrome is up: its start overlaps the wait */
+  pace?: () => Promise<void>;
 }): Promise<PageFetchResult> {
   const timeoutMs = o.timeoutMs ?? 30_000;
   const release = hold();
   try {
     const ctx = await openBrowser(o);
-    const once = async (page: Page, hop: Hop, left: number) => {
+    await o.pace?.();
+    const once = async (entry: OriginPage, hop: Hop, left: number) => {
+      const { page } = entry;
+      const origin = new URL(hop.url).origin;
+      const w: Watch = {
+        mine: (method, url) => method === hop.method && URL.parse(url)?.origin === origin,
+        started: false,
+        sealed: false,
+      };
+      entry.watches.add(w);
       const redirects: Response[] = [];
       const onResponse = (res: Response) => void (res.status() >= 300 && res.status() < 400 && redirects.push(res));
       page.on("response", onResponse);
       const run = page.evaluate(
-        async ({ url, method, headers, body, left }) => {
+        async ({ url, method, headers, body, left, credentials }) => {
           const r = await fetch(url, {
             method,
             headers,
             body,
-            credentials: "include",
+            credentials,
             redirect: "manual",
             signal: AbortSignal.timeout(left),
           });
@@ -1169,52 +1330,92 @@ export async function pageFetch(o: {
           });
           return { opaque: false as const, status: r.status, headers: h, body: await r.text(), url: r.url };
         },
-        { ...hop, left },
+        { ...hop, left, credentials: o.credentials ?? ("include" as const) },
       );
       // the page itself can hang (a stuck renderer): the budget holds either way
       let timer: NodeJS.Timeout | undefined;
+      let quietTimer: NodeJS.Timeout | undefined;
       const late = new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error(`no response within ${timeoutMs} ms`)), left + 1000);
       });
+      // cut short by the deadline, the window says nothing about the page: the call ran out of time
+      const why =
+        left < START_MS
+          ? `no response within ${timeoutMs} ms: the page never sent the request`
+          : `the page did not send the request within ${START_MS} ms`;
+      const quiet = new Promise<never>((_, reject) => {
+        quietTimer = setTimeout(() => void (!w.started && reject(new NotStarted(why))), Math.min(START_MS, left));
+      });
       try {
-        const r = await Promise.race([run, late]);
+        const r = await Promise.race([run, late, quiet]);
         return r.opaque ? await redirectOf(redirects, hop, r.url) : { ...r, location: undefined };
       } catch (e) {
-        if (/TimeoutError|timed out|signal timed out/i.test((e as Error).message))
-          throw new Error(`no response within ${timeoutMs} ms`);
+        const message = (e as Error).message;
+        const timedOut = /TimeoutError|timed out|signal timed out|no response within/i.test(message);
+        if (!w.started) {
+          // decided before anything was let go, so whatever the page sends from now on is failed
+          w.sealed = true;
+          if (e instanceof NotStarted) throw e;
+          if (timedOut) throw new NotStarted(`no response within ${timeoutMs} ms: the page never sent the request`);
+          if (page.isClosed() || /Execution context was destroyed|navigat/i.test(message))
+            throw new NotStarted(`the page went away before it sent the request: ${message.split("\n")[0]}`);
+        }
+        if (timedOut) throw new Error(`no response within ${timeoutMs} ms`);
         throw e;
       } finally {
         clearTimeout(timer);
+        clearTimeout(quietTimer);
         page.off("response", onResponse);
+        if (!w.sealed) entry.watches.delete(w);
+        if (entry.retired) retire(entry);
       }
     };
     // One deadline for the whole call from here, with Chrome up: the origin page's load, every hop
     // of the fetch and a recovery after the page navigated all draw on it.
     const deadline = Date.now() + timeoutMs;
     const left = () => Math.max(1, deadline - Date.now());
-    let page = await originPage(ctx, o.origin, left);
-    const fetchHop = async (hop: Hop) => {
-      try {
-        return await once(page, hop, left());
-      } catch (e) {
-        if (!o.retryOnNavigation || !/Execution context was destroyed|navigat/i.test((e as Error).message)) throw e;
-        // waitForFunction outlives a context swap (a bare load-state wait can resolve on the old document)
-        await page
-          .waitForFunction(() => document.readyState !== "loading", undefined, { timeout: left() })
-          .catch(() => {});
-        // it may have landed on another origin (a challenge's redirect): start from a fresh page on ours
-        let here = "";
+    let entry = await originPage(ctx, o.origin, left);
+    let replaced = false;
+    let navigated = false;
+    /** `first`: no hop before this one was sent, so a hop that never left means the call sent nothing */
+    const fetchHop = async (hop: Hop, first: boolean) => {
+      for (;;) {
         try {
-          here = new URL(page.url()).origin;
-        } catch {
-          /* about:blank */
+          return await once(entry, hop, left());
+        } catch (e) {
+          if (e instanceof NotStarted) {
+            // nothing left, so even a write may go again: once, from a fresh page, inside the same deadline
+            retire(entry);
+            if (replaced || left() <= 1) throw first ? new PageUnreachable(e.message) : new Error(e.message);
+            replaced = true;
+            entry = await originPage(ctx, o.origin, left);
+            continue;
+          }
+          if (
+            navigated ||
+            !o.retryOnNavigation ||
+            !/Execution context was destroyed|navigat/i.test((e as Error).message)
+          )
+            throw e;
+          navigated = true;
+          const { page } = entry;
+          // waitForFunction outlives a context swap (a bare load-state wait can resolve on the old document)
+          await page
+            .waitForFunction(() => document.readyState !== "loading", undefined, { timeout: left() })
+            .catch(() => {});
+          // it may have landed on another origin (a challenge's redirect): start from a fresh page on ours
+          let here = "";
+          try {
+            here = new URL(page.url()).origin;
+          } catch {
+            /* about:blank */
+          }
+          if (here !== o.origin) {
+            retire(entry);
+            await within(page.close(), undefined, Math.min(SEAL_MS, left()));
+            entry = await originPage(ctx, o.origin, left);
+          }
         }
-        if (here !== o.origin) {
-          originPages.delete(o.origin);
-          await page.close().catch(() => {});
-          page = await originPage(ctx, o.origin, left);
-        }
-        return await once(page, hop, left());
       }
     };
     // Pseudo-headers are invalid names for fetch(); forbidden ones (cookie, host, ...) the browser drops itself.
@@ -1224,12 +1425,18 @@ export async function pageFetch(o: {
     const t0 = performance.now();
     let redirected = false;
     // Redirects are taken by hand, as at tier 1; how many is the policy's to say.
-    for (let hops = 0; ; hops++) {
-      const { location, ...r } = await fetchHop(hop);
-      redirected ||= !!location;
-      if (!location || !o.redirect)
-        return { ...r, ms: Math.round(performance.now() - t0), ...(redirected ? { redirected } : {}) };
-      hop = o.redirect(hop, r.status, location, hops);
+    try {
+      for (let hops = 0; ; hops++) {
+        const { location, ...r } = await fetchHop(hop, hops === 0);
+        redirected ||= !!location;
+        if (!location || !o.redirect)
+          return { ...r, ms: Math.round(performance.now() - t0), ...(redirected ? { redirected } : {}) };
+        hop = await o.redirect(hop, r.status, location, hops);
+      }
+    } catch (e) {
+      // a page a call failed on (a dead server, a stale document, a stall) is not handed to the next one
+      retire(entry);
+      throw e;
     }
   } finally {
     release();
@@ -1238,7 +1445,8 @@ export async function pageFetch(o: {
 
 /**
  * Open `url` headed so the user can sign in. Resolves when they close the window or press Enter
- * in the terminal; what counts as logged in is the caller's call. Returns the site's cookies.
+ * in the terminal; what counts as logged in is the caller's call. Returns the site's cookies as the
+ * window opened, before the page loaded, and as it closed.
  */
 export async function login({
   url,
@@ -1248,7 +1456,7 @@ export async function login({
   url: string;
   profileDir: string;
   waitForEnter?: boolean;
-}): Promise<StoredCookie[]> {
+}): Promise<{ opened: StoredCookie[]; closed: StoredCookie[] }> {
   const release = hold();
   try {
     return await loginWindow(url, profileDir, waitForEnter);
@@ -1257,40 +1465,89 @@ export async function login({
   }
 }
 
-async function loginWindow(url: string, profileDir: string, waitForEnter: boolean): Promise<StoredCookie[]> {
+// It does not close itself once a login cookie appears: a site can set its session cookie before a
+// second factor, a consent page or a redirect back from the identity provider is done, and closing
+// then would keep a half-finished sign-in.
+async function loginWindow(
+  url: string,
+  profileDir: string,
+  waitForEnter: boolean,
+): Promise<{ opened: StoredCookie[]; closed: StoredCookie[] }> {
   const ctx = await openBrowser({ profileDir, headless: false });
+  const opened = siteCookies(await ctx.cookies(), url);
   const page = ctx.pages()[0] ?? (await ctx.newPage());
-  await page.goto(url);
-  // Closing the last window closes the context, after which cookies can't be read, so keep a snapshot.
-  let snapshot = await ctx.cookies();
-  const poll = setInterval(
-    () =>
-      ctx.cookies().then(
-        (c) => (snapshot = c),
-        () => {},
-      ),
-    1000,
-  );
+  // Playwright answers the window's dialogs, not the human: leaving or closing a page is never refused
+  // (a dismissed beforeunload would keep it open), an alert is only read, a confirm or prompt declined.
+  const onDialog = (d: Dialog) => answer(d, d.type() === "beforeunload" || d.type() === "alert");
+  const onPage = (p: Page) => p.on("dialog", onDialog);
+  onPage(page);
+  ctx.on("page", onPage); // a sign-in popup (an identity provider) too
+  // The cookies are read while the window is open, never after it closed: closing Chrome's last window
+  // on Linux or Windows quits it, and a quitting Chrome's jar has lost its session cookies (a login
+  // cookie among them, on many sites). So the jar is read on every response, where a Set-Cookie lands,
+  // and every half second for one a script sets. A read counts only if it completed while the window
+  // was open (one in flight when it closed may answer from the quitting jar), and of those the newest
+  // started is kept.
+  let snapshot: Cookie[] = [];
+  let started = 0;
+  let kept = 0;
+  /** no more reads start */
+  let shut = false;
+  /** the window began closing: no read that completes from here counts */
+  let closing = false;
+  const reads = new Set<Promise<void>>();
+  const read = () => {
+    if (shut) return;
+    const n = ++started;
+    const r = ctx.cookies().then(
+      (c) => {
+        if (!closing && n > kept) [kept, snapshot] = [n, c];
+      },
+      () => {},
+    );
+    reads.add(r);
+    void r.finally(() => reads.delete(r));
+  };
+  ctx.on("response", read);
+  const poll = setInterval(read, 500);
   let onEnter = () => {};
+  let entered = false;
+  const done = new Promise<void>((resolve) => {
+    onEnter = () => {
+      entered = true;
+      resolve();
+    };
+    const close = () => {
+      closing = true;
+      shut = true;
+      resolve();
+    };
+    ctx.once("close", close);
+    page.once("close", close);
+    // The MCP server's stdin is its transport; only the CLI reads Enter.
+    if (waitForEnter) {
+      process.stdin.once("data", onEnter);
+      process.stdin.resume();
+    }
+  });
   try {
-    await new Promise<void>((resolve) => {
-      onEnter = resolve;
-      ctx.once("close", () => resolve());
-      page.once("close", () => resolve());
-      // The MCP server's stdin is its transport; only the CLI reads Enter.
-      if (waitForEnter) {
-        process.stdin.once("data", onEnter);
-        process.stdin.resume();
-      }
-    });
-    snapshot = await ctx.cookies().catch(() => snapshot);
+    // A user who clicks away before the page has loaded interrupts this navigation; the window stays theirs.
+    await page.goto(url).catch(() => {});
+    read();
+    await done;
+    // Enter leaves the window open, so one more read is current (unless the user closes it meanwhile).
+    if (entered && !shut) read();
+    shut = true;
+    await Promise.all(reads);
   } finally {
     clearInterval(poll);
+    ctx.off("response", read);
+    ctx.off("page", onPage);
     if (waitForEnter) {
       process.stdin.off("data", onEnter);
       process.stdin.pause();
     }
     await closeBrowser();
   }
-  return siteCookies(snapshot, url);
+  return { opened, closed: siteCookies(snapshot, url) };
 }

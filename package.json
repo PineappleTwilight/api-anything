@@ -1,6 +1,6 @@
 {
   "name": "api-anything",
-  "version": "0.1.0",
+  "version": "0.3.1",
   "description": "Learn reusable operations from a website's browser traffic and call them from a CLI, library or MCP server.",
   "license": "MIT",
   "type": "module",
@@ -32,11 +32,13 @@
     "build": "tsc -p tsconfig.build.json",
     "prepare": "tsc -p tsconfig.build.json",
     "cli": "tsx src/cli.ts",
-    "test": "node --import tsx --test test/*.test.ts test/edge/*.test.ts",
+    "test": "node --import tsx --test test/*.test.ts test/edge/*.test.ts registry/test/*.test.ts",
     "check": "tsc -p tsconfig.json",
     "lint": "biome ci .",
     "format": "biome check --write .",
-    "demo": "node examples/research.mjs"
+    "demo": "node examples/research.mjs",
+    "smoke:pack": "node --import tsx test/smoke-pack.ts",
+    "prepublishOnly": "npm run check && npm run lint"
   },
   "keywords": [
     "api",
@@ -56,12 +58,16 @@
     "node-html-parser": "^9.0.4",
     "playwright-core": "^1.63.0",
     "tldts": "^7.4.16",
-    "zod": "^4.6.5"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15",
     "@types/node": "^26.6.3",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
+  },
+  "homepage": "https://api-anything-registry.forth-site.workers.dev",
+  "bugs": {
+    "url": "https://github.com/goodnight000/api-anything/issues"
   }
 }

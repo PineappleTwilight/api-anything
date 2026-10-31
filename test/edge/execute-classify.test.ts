@@ -20,7 +20,7 @@ import { profileDir } from "../../src/heal.js";
 import { importSession } from "../../src/login.js";
 import { cookieHeaderFor, cookieValue, loadSession, saveSession } from "../../src/session.js";
 import { type Operation, OperationSchema, parseSite } from "../../src/spec.js";
-import { rememberTier, saveSite } from "../../src/store.js";
+import { rememberedTier, rememberTier, saveSite } from "../../src/store.js";
 import type { StoredCookie } from "../../src/types.js";
 import { makeChromiumDb } from "../fixture/cookie-db.js";
 import { type Fixture, startFixture } from "./execute-classify.fixture.js";
@@ -422,7 +422,8 @@ describe("timeouts and network errors", () => {
     const s = await call("rl", "s", {}, t1);
     assert.equal(s.class, "rate");
     assert.match(`${s.reason} ${s.next}`, /120/, JSON.stringify(s));
-    const d = await call("rl", "d", {}, t1);
+    // sent, though the first 429 cooled the site down
+    const d = await call("rl", "d", {}, { ...t1, ignoreCoolDown: true });
     assert.match(`${d.reason} ${d.next}`, /2026-10-21|Oct 2026/, JSON.stringify(d));
   });
 });
@@ -513,9 +514,11 @@ describe("classification", () => {
   });
 
   test("5xx is error (retry hint), 4xx without markers is not auth", () => {
+    assert.equal(classify(gqlOp(), obs(503, "Service Unavailable", "text/plain")).class, "error");
+    // one that names its wait is a limit
     assert.equal(
       classify(gqlOp(), obs(503, "Service Unavailable", "text/plain", { "retry-after": "30" })).class,
-      "error",
+      "rate",
     );
     assert.equal(classify(gqlOp(), obs(500, '{"error":"internal"}')).class, "error");
     assert.equal(classify(gqlOp(), obs(403, '{"message":"CSRF token missing or incorrect."}')).class, "auth");
@@ -638,7 +641,7 @@ describe("execution ladder", () => {
     const t0 = Date.now();
     const rs = await Promise.all([1, 2, 3].map(() => call("conc", "l", {}, { ...t1, minIntervalMs: 100 })));
     assert.ok(rs.every((r) => r.ok));
-    assert.ok(Date.now() - t0 >= 190, "3 requests at 100 ms spacing");
+    assert.ok(Date.now() - t0 >= 135, "3 requests at 100 ms ±30% spacing");
   });
 });
 
@@ -1012,8 +1015,18 @@ describe("browser tiers", { skip: !browserAvailable() && "no Chromium browser in
           );
       // a POST: Chrome's cache makes a second GET of one URL wait for the first
       if (req.url?.startsWith("/twin")) {
-        // held until the page's own request and the call's are both in; then each is sent somewhere else
-        if (waiting.push(res) === 2) waiting.forEach((w, i) => void w.writeHead(302, { location: `/to-${i}` }).end());
+        // held until a second copy comes in (the page's own, then the call's); then each is sent
+        // somewhere else. One alone goes on after 3 s: a page replaced for a stall sends its own again.
+        const mate = waiting.shift();
+        if (mate) {
+          mate.writeHead(302, { location: "/to-0" }).end();
+          return void res.writeHead(302, { location: "/to-1" }).end();
+        }
+        waiting.push(res);
+        setTimeout(() => {
+          if (waiting.includes(res))
+            waiting.splice(waiting.indexOf(res), 1)[0]!.writeHead(302, { location: "/to-alone" }).end();
+        }, 3000).unref();
         return;
       }
       landed.push(req.url!);
@@ -1084,13 +1097,14 @@ describe("browser tiers", { skip: !browserAvailable() && "no Chromium browser in
       assert.deepEqual(r.data, [{ me: "second" }]);
       assert.equal(me(), 2, "one retry");
 
-      // logged out with nothing new to import: one retry, then the login hint
+      // logged out with nothing new to import: the same cookies again are not retried, and the hint
+      // names the profile to sign in to again, since login would import the same ones
       fx.state.sid = "third";
       fx.hits.length = 0;
       const out = await call("t2auth", "me", {}, o);
       assert.equal(out.class, "auth", JSON.stringify(out));
-      assert.match(out.next ?? "", /api-anything login t2auth/);
-      assert.equal(me(), 2, "at most once per call");
+      assert.match(out.next ?? "", /sign in to 127\.0\.0\.1 in Chrome profile "Default"/);
+      assert.equal(me(), 1, "no retry with the same cookies");
 
       // a write answered 200 with the login page may have run: never resent
       fx.hits.length = 0;
@@ -1154,13 +1168,13 @@ describe("browser tiers", { skip: !browserAvailable() && "no Chromium browser in
       assert.deepEqual(r.data, [{ me: "second" }]);
       assert.equal(me(), 2, "one retry");
 
-      // logged out with nothing new to import: one retry, then the login hint
+      // logged out with nothing new to import: no retry, and the hint names the profile
       fx.state.sid = "third";
       fx.hits.length = 0;
       const out = await call("t3auth", "me", {}, o);
       assert.equal(out.class, "auth", JSON.stringify(out));
-      assert.match(out.next ?? "", /api-anything login t3auth/);
-      assert.equal(me(), 2, "at most once per call");
+      assert.match(out.next ?? "", /sign in to 127\.0\.0\.1 in Chrome profile "Default"/);
+      assert.equal(me(), 1, "no retry with the same cookies");
     } finally {
       delete process.env.API_ANYTHING_BROWSER_ROOTS;
     }
@@ -1402,6 +1416,58 @@ describe("browser tiers", { skip: !browserAvailable() && "no Chromium browser in
     }
   });
 
+  test("a tier-2 page still busy at the deadline is reported as the deadline, not as a stalled page", async () => {
+    // the root page's renderer is busy for 1.5 s right after load, so its fetch can't start before a 1 s deadline
+    const busy = createHttpServer((req, res) => {
+      if (req.url !== "/") return;
+      res
+        .writeHead(200, { "content-type": "text/html" })
+        .end("<!doctype html><script>setTimeout(()=>{for(const e=Date.now()+1500;Date.now()<e;);})</script>");
+    });
+    await new Promise<void>((r) => busy.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(busy.address() as AddressInfo).port}`;
+    try {
+      site("t2up", rd("up", "/plain", { minTier: 2 }));
+      assert.equal((await call("t2up", "up", {}, { maxTier: 2, minIntervalMs: 0 })).ok, true, "Chrome is up");
+      const request = { method: "GET", url: `${base}/api`, headers: {} };
+      saveSite(parseSite({ name: "t2busy", baseUrl: base, operations: [rd("n", "/api", { minTier: 2, request })] }));
+      const r = await call("t2busy", "n", {}, { maxTier: 2, minIntervalMs: 0, timeoutMs: 1000 });
+      assert.equal(r.ok, false, JSON.stringify(r));
+      assert.match(r.reason ?? "", /no response within 1000 ms/);
+      assert.doesNotMatch(r.reason ?? "", /within 2000 ms/);
+    } finally {
+      busy.closeAllConnections();
+      busy.close();
+    }
+  });
+
+  test("a cached page that never sends the fetch is replaced, the write goes once, and what the page sends when it wakes never leaves", async () => {
+    site("t2stall", rd("up", "/plain", { minTier: 2 }), {
+      ...rd("save", "/api/stalled", { minTier: 2 }),
+      readOnly: false,
+      request: { method: "POST", url: `${fx.base}/api/stalled`, headers: {}, body: "x=1" },
+    });
+    assert.equal((await call("t2stall", "up", {}, { maxTier: 2, minIntervalMs: 0 })).ok, true, "the page is cached");
+    const cached = (await openBrowser({ profileDir: profileDir() })).pages().find((p) => p.url() === `${fx.base}/`);
+    assert.ok(cached, "the cached origin page");
+    // a renderer that runs nothing for longer than the call may take, as a stalled one did
+    const busy = Date.now() + 6000;
+    await cached.evaluate(
+      (until) =>
+        void setTimeout(() => {
+          while (Date.now() < until);
+        }),
+      busy,
+    );
+    const r = await call("t2stall", "save", {}, { maxTier: 2, minIntervalMs: 0, timeoutMs: 4000, allowWrites: true });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.tier, 2);
+    assert.equal(r.write, "accepted");
+    // the stalled page wakes up and runs the fetch it was handed
+    await new Promise((res) => setTimeout(res, Math.max(0, busy + 1500 - Date.now())));
+    assert.equal(fx.hits.filter((h) => h.url === "/api/stalled").length, 1, "sent once");
+  });
+
   test("a second process (CLI next to a running MCP server) can still use tier 2", async () => {
     await closeBrowser();
     site("two", rd("l", "/plain", { minTier: 2 }));
@@ -1453,6 +1519,130 @@ test("two processes merging browser cookies into one jar lose nothing", async ()
   assert.deepEqual(codes, [0, 0]);
   const n = loadSession("race").cookies.length;
   assert.equal(n, 300, `jar kept ${n} of 300 cookies`);
+});
+
+describe("a read refused for the browser's identity headers", () => {
+  const UA =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+  /** what a learned op copies from Chrome, identity and all */
+  const chrome = () => ({
+    "user-agent": UA,
+    "sec-ch-ua": '"Chromium";v="130", "Google Chrome";v="130"',
+    "sec-ch-ua-platform": '"macOS"',
+    "sec-fetch-site": "same-origin",
+    "sec-fetch-dest": "empty",
+    accept: "application/json",
+    referer: `${fx.base}/`,
+  });
+  const at = (path: string, over: Record<string, unknown> = {}) =>
+    rd("from", path, { request: { method: "GET", url: `${fx.base}${path}`, headers: chrome() }, ...over });
+  const sent = (path: string) => fx.hits.filter((h) => h.url.startsWith(path));
+
+  test("plain HTTP answers without them at tier 1, under max tier 1, and nothing is kept", async () => {
+    site("sorry", at("/api/sorry?site=arxiv.org"));
+    const r = await call("sorry", "from", {}, t1);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.tier, 1);
+    assert.deepEqual(r.data, [{ sorry: "ok" }]);
+    assert.match(r.reason ?? "", /^tier 1 said auth \(HTTP 419: Sorry\); plain HTTP answered without the browser's/);
+    const [first, second] = sent("/api/sorry");
+    assert.equal(sent("/api/sorry").length, 2);
+    assert.match(String(first!.headers["user-agent"]), /Chrome\//);
+    assert.equal(second!.url, first!.url);
+    assert.doesNotMatch(String(second!.headers["user-agent"]), /Chrome\//);
+    for (const h of ["sec-ch-ua", "sec-ch-ua-platform", "sec-fetch-site", "sec-fetch-dest"])
+      assert.equal(second!.headers[h], undefined, h);
+    assert.equal(second!.headers.accept, "application/json");
+    assert.equal(second!.headers.referer, `${fx.base}/`);
+    assert.equal(rememberedTier("sorry", "from"), undefined);
+    fx.hits.length = 0;
+    assert.equal((await call("sorry", "from", {}, t1)).ok, true);
+    assert.equal(sent("/api/sorry").length, 2, "the next call sends the stored template first again");
+  });
+
+  test("a wall that answers 403 (blocked) gets the same retry instead of a browser", async () => {
+    site("sorry403", at("/api/sorry?wall=403"));
+    const r = await call("sorry403", "from", {}, t1);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.tier, 1);
+    assert.match(r.reason ?? "", /^tier 1 said blocked/);
+    assert.equal(sent("/api/sorry").length, 2);
+  });
+
+  test("a site that wants the Chrome user-agent answers the first request: no retry", async () => {
+    site("wantsua", at("/api/picky"));
+    const r = await call("wantsua", "from", {}, t1);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.reason, undefined);
+    assert.equal(sent("/api/picky").length, 1);
+  });
+
+  test("a write is sent once, even after a 401 a write may be retried after", async () => {
+    site(
+      "sorrywrite",
+      at("/api/sorry", {
+        readOnly: false,
+        request: { method: "POST", url: `${fx.base}/api/sorry?wall=401`, headers: chrome(), body: "x=1" },
+      }),
+    );
+    const r = await call("sorrywrite", "from", {}, { ...t1, allowWrites: true });
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(sent("/api/sorry").length, 1);
+  });
+
+  test("no retry for an op without them, a login on record, or a slot that fills the user-agent", async () => {
+    site("bare419", rd("from", "/api/picky"));
+    assert.equal((await call("bare419", "from", {}, t1)).class, "auth");
+    assert.equal(sent("/api/picky").length, 1, "nothing to remove");
+
+    fx.hits.length = 0;
+    site("signedin", at("/api/sorry", { learnedLoggedIn: true }));
+    assert.equal((await call("signedin", "from", {}, t1)).class, "auth");
+    assert.equal(sent("/api/sorry").length, 1, "learned signed in");
+
+    fx.hits.length = 0;
+    site("withref", at("/api/sorry", { slots: [{ ref: "cookie:ct0", at: ["header:x-csrf-token"] }] }));
+    saveSession("withref", { cookies: [cookie("ct0", "c", "127.0.0.1")], values: {} });
+    assert.equal((await call("withref", "from", {}, t1)).class, "auth");
+    assert.equal(sent("/api/sorry").length, 1, "takes a cookie");
+
+    fx.hits.length = 0;
+    saveSite(parseSite({ name: "jarlogin", baseUrl: fx.base, loginCookies: ["sid"], operations: [at("/api/sorry")] }));
+    saveSession("jarlogin", { cookies: [cookie("sid", "s", "127.0.0.1")], values: {} });
+    assert.equal((await call("jarlogin", "from", {}, t1)).class, "auth");
+    assert.equal(sent("/api/sorry").length, 1, "a live login cookie in the jar");
+
+    fx.hits.length = 0;
+    site(
+      "uaslot",
+      at("/api/sorry", {
+        params: [{ name: "ua", required: true }],
+        slots: [{ param: "ua", at: ["header:user-agent"] }],
+      }),
+    );
+    assert.equal((await call("uaslot", "from", { ua: UA }, t1)).class, "auth");
+    assert.equal(sent("/api/sorry").length, 1, "the caller fills the user-agent");
+  });
+
+  test("a retry answering 429 is the call's answer: no browser", async () => {
+    site("sorryrate", at("/api/sorry?bare=429"));
+    const r = await call("sorryrate", "from", {}, { minIntervalMs: 0, timeoutMs: 3000 });
+    assert.equal(r.class, "rate", JSON.stringify(r));
+    assert.equal(r.tier, 1);
+    assert.match(r.reason ?? "", /^tier 1 said auth .*without the browser's identity headers: /);
+    assert.equal(sent("/api/sorry").length, 2);
+    assert.equal(rememberedTier("sorryrate", "from"), undefined);
+  });
+
+  test("a retry refused again leaves the ladder as it was: tier 1's auth and the login hint", async () => {
+    site("sorryagain", at("/api/sorry?bare=419"));
+    const r = await call("sorryagain", "from", {}, t1);
+    assert.equal(r.class, "auth", JSON.stringify(r));
+    assert.equal(r.tier, 1);
+    assert.equal(r.reason, "HTTP 419: Sorry");
+    assert.match(r.next ?? "", /api-anything login sorryagain/);
+    assert.equal(sent("/api/sorry").length, 2);
+  });
 });
 
 test("two processes writing state.json (tier memory, stale marks) lose nothing", async () => {
